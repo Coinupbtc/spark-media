@@ -28,6 +28,17 @@ python3 -I spark_media.py import-discord-log
 python3 -I spark_media.py stats
 ```
 
+## Studio — trim, order, stitch (2026-11-03)
+
+Tap **☑ Select** in the gallery, tap clips (or photos), then **Open Studio** (`/studio`); or **＋ Add to Studio** on any item page.
+In the Studio: reorder (↑ ↓), remove, set in/out points per clip (type seconds, or **▶ preview** and **set in / set out** from
+the player's current time), photos become stills (default 3 s). Options: crossfade (default 0.4 s) or hard cut, fade in/out
+at the ends, output size (auto = largest clip; everything is scaled/letterboxed to one size at 24 fps), mute. **⚙ Compile**
+queues a job: each clip is normalised (trim → scale/pad → 24 fps → stereo 48 kHz), then joined with `xfade`/`acrossfade` or
+`concat`, encoded with libx264 (CRF 18, faststart); the job page shows live progress; the result is ingested as a library item
+(tier `compile`, project `studio`) with a JSON sidecar holding the full recipe, so **✂ Re-edit this compile** reopens it in the
+Studio. Clips longer than 15 s still come from chaining at render time (`h3-long-chain.sh`); the Studio stitches anything after.
+
 Add a root: append `{"path": "~/...", "label": "name", "kinds": ["video","image"], "exclude": ["regex"]}` to
 `config.json`; the next scan picks it up. Metadata precedence per clip: sidecar JSON → twin-test `.txt` → `prompt.txt` →
 `gen.log` → Discord caption → filename prefix.

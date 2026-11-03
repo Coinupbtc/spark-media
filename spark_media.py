@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS items (
 CREATE INDEX IF NOT EXISTS items_created ON items(created_at DESC);
 CREATE INDEX IF NOT EXISTS items_project ON items(project);
 CREATE TABLE IF NOT EXISTS seen (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, sha256 TEXT);
+CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, created_at TEXT, status TEXT, progress REAL DEFAULT 0, spec TEXT, output TEXT DEFAULT '', item_id INTEGER, log TEXT DEFAULT '', error TEXT DEFAULT '');
 """
 
 
@@ -348,6 +349,178 @@ def import_discord_log(path: Path = HOME / "logs" / "discord" / "discord-media-s
     return n
 
 
+# ----------------------------------------------------------------------------- studio: trim / order / stitch
+COMPILES = LIB / "compiles"
+_job_wake = threading.Event()
+
+
+def has_audio(path: Path) -> bool:
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
+                         capture_output=True, text=True, timeout=30).stdout
+    return "audio" in out
+
+
+def _ff(cmd: list[str], timeout: int = 1800) -> None:
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-y", "-v", "error", *cmd], capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "ffmpeg failed").strip()[-800:])
+
+
+def _ff_progress(cmd: list[str], total: float, cb, timeout: int = 3600) -> None:
+    proc = subprocess.Popen(["ffmpeg", "-hide_banner", "-y", "-v", "error", "-progress", "pipe:1", "-nostats", *cmd],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    t0 = time.time()
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+            try:
+                us = int(line.split("=", 1)[1])
+                if total > 0:
+                    cb(min(0.99, us / 1e6 / total))
+            except ValueError:
+                pass
+        if time.time() - t0 > timeout:
+            proc.kill()
+            raise RuntimeError("ffmpeg timed out")
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr.read() if proc.stderr else "ffmpeg failed").strip()[-800:])
+
+
+def compile_spec(jid: int, spec: dict, cb) -> tuple[Path, float, dict]:
+    """spec = {title, clips:[{id, in, out, still}], transition: cut|fade, xfade, fade_ends, size: auto|WxH, mute}"""
+    c = db()
+    rows = {}
+    for cl in spec["clips"]:
+        r = c.execute("SELECT * FROM items WHERE id=?", (int(cl["id"]),)).fetchone()
+        if not r:
+            raise ValueError(f"item {cl['id']} not in the library")
+        rows[int(cl["id"])] = r
+    c.close()
+    if not rows:
+        raise ValueError("no clips")
+    vids = [r for r in rows.values() if r["kind"] == "video" and r["width"]]
+    if spec.get("size") and spec["size"] != "auto":
+        W, H = (int(x) for x in spec["size"].lower().split("x"))
+    elif vids:
+        big = max(vids, key=lambda r: r["width"] * (r["height"] or 0))
+        W, H = big["width"], big["height"]
+    else:
+        W, H = 1280, 704
+    W, H = W - W % 2, H - H % 2
+    fps = 24
+    mute = bool(spec.get("mute"))
+    tmp = COMPILES / f"job-{jid}"
+    tmp.mkdir(parents=True, exist_ok=True)
+    vf_norm = f"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,fps={fps},format=yuv420p"
+    enc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
+    segs: list[tuple[Path, float]] = []
+    n = len(spec["clips"])
+    sources = []
+    for i, cl in enumerate(spec["clips"]):
+        r = rows[int(cl["id"])]
+        src = Path(r["store_path"])
+        seg = tmp / f"seg{i:02d}.mp4"
+        if r["kind"] == "video":
+            total = float(r["duration"] or 0)
+            a = max(0.0, float(cl.get("in") or 0))
+            b = float(cl.get("out") or total) if cl.get("out") else total
+            b = min(b, total) if total else b
+            if b - a < 0.2:
+                raise ValueError(f"clip {r['id']}: out must be at least 0.2 s after in")
+            dur = b - a
+            vf = f"trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS,{vf_norm}"
+            if has_audio(src) and not mute:
+                af = f"atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo"
+                _ff(["-i", str(src), "-filter_complex", f"[0:v]{vf}[v];[0:a]{af}[a]", "-map", "[v]", "-map", "[a]", "-t", f"{dur:.3f}", *enc, str(seg)])
+            else:
+                _ff(["-i", str(src), "-f", "lavfi", "-t", f"{dur:.3f}", "-i", "anullsrc=r=48000:cl=stereo", "-filter_complex", f"[0:v]{vf}[v]",
+                     "-map", "[v]", "-map", "1:a", "-t", f"{dur:.3f}", *enc, str(seg)])
+            sources.append({"id": r["id"], "sha12": r["sha12"], "in": a, "out": b, "orig_path": r["orig_path"]})
+        else:
+            dur = max(0.5, float(cl.get("still") or 3.0))
+            _ff(["-loop", "1", "-t", f"{dur:.3f}", "-i", str(src), "-f", "lavfi", "-t", f"{dur:.3f}", "-i", "anullsrc=r=48000:cl=stereo",
+                 "-filter_complex", f"[0:v]{vf_norm}[v]", "-map", "[v]", "-map", "1:a", "-t", f"{dur:.3f}", *enc, str(seg)])
+            sources.append({"id": r["id"], "sha12": r["sha12"], "still": dur, "orig_path": r["orig_path"]})
+        segs.append((seg, dur))
+        cb(0.05 + 0.45 * (i + 1) / n)
+    durs = [d for _, d in segs]
+    fade = max(0.0, float(spec.get("xfade") or 0.4)) if spec.get("transition") == "fade" and len(segs) > 1 else 0.0
+    fade = min(fade, min(durs) / 2.5)
+    ends = max(0.0, float(spec.get("fade_ends") or 0))
+    inputs = []
+    for seg, _ in segs:
+        inputs += ["-i", str(seg)]
+    if fade > 0:
+        total = sum(durs) - fade * (len(segs) - 1)
+        vparts, aparts, acc = [], [], durs[0]
+        prev_v, prev_a = "[0:v]", "[0:a]"
+        for k in range(1, len(segs)):
+            off = acc - fade
+            vparts.append(f"{prev_v}[{k}:v]xfade=transition=fade:duration={fade:.3f}:offset={off:.3f}[v{k}]")
+            aparts.append(f"{prev_a}[{k}:a]acrossfade=d={fade:.3f}[a{k}]")
+            prev_v, prev_a = f"[v{k}]", f"[a{k}]"
+            acc = acc + durs[k] - fade
+        vout, aout = prev_v, prev_a
+        graph = ";".join(vparts + aparts)
+    else:
+        total = sum(durs)
+        if len(segs) > 1:
+            graph = "".join(f"[{k}:v][{k}:a]" for k in range(len(segs))) + f"concat=n={len(segs)}:v=1:a=1[vc][ac]"
+            vout, aout = "[vc]", "[ac]"
+        else:
+            graph, vout, aout = "", "[0:v]", "[0:a]"
+    ends = min(ends, total / 3)
+    if ends > 0:
+        tail = f"{vout}fade=t=in:st=0:d={ends:.3f},fade=t=out:st={max(0.0, total - ends):.3f}:d={ends:.3f}[vf];{aout}afade=t=in:st=0:d={ends:.3f},afade=t=out:st={max(0.0, total - ends):.3f}:d={ends:.3f}[af]"
+        graph = (graph + ";" if graph else "") + tail
+        vout, aout = "[vf]", "[af]"
+    if graph == "":
+        graph = f"{vout}null[vf];{aout}anull[af]"
+        vout, aout = "[vf]", "[af]"
+    title = (spec.get("title") or "compile").strip()[:80]
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("_") or "compile"
+    out = COMPILES / f"{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}-{slug}.mp4"
+    _ff_progress([*inputs, "-filter_complex", graph, "-map", vout, "-map", aout, "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                  "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)], total, lambda f: cb(0.5 + 0.5 * f))
+    shutil.rmtree(tmp, ignore_errors=True)
+    side = {"tool": "spark-media studio", "tier": "compile", "title": title, "spec": spec, "sources": sources, "duration": round(total, 3),
+            "width": W, "height": H, "fps": fps, "created": dt.datetime.now().isoformat(timespec="seconds"),
+            "prompt": f"Compiled from {len(sources)} clips: " + " + ".join(f"#{x['id']}" for x in sources)}
+    (out.parent / (out.name + ".json")).write_text(json.dumps(side, indent=1))
+    return out, total, side
+
+
+def jobs_loop() -> None:
+    while True:
+        _job_wake.wait(timeout=2.0)
+        _job_wake.clear()
+        c = db()
+        job = c.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
+        c.close()
+        if not job:
+            continue
+        jid = job["id"]
+
+        def cb(f: float, jid=jid):
+            cj = db()
+            cj.execute("UPDATE jobs SET progress=? WHERE id=?", (round(float(f), 3), jid))
+            cj.commit(); cj.close()
+
+        c = db(); c.execute("UPDATE jobs SET status='running', progress=0.02 WHERE id=?", (jid,)); c.commit(); c.close()
+        try:
+            spec = json.loads(job["spec"])
+            out, total, side = compile_spec(jid, spec, cb)
+            c = db()
+            iid = ingest_file(c, out, project="studio", tier="compile", caption=side["title"], prompt=side["prompt"])
+            c.execute("UPDATE jobs SET status='done', progress=1, output=?, item_id=? WHERE id=?", (str(out), iid, jid))
+            c.commit(); c.close()
+            log(f"job {jid} done: {out} ({total:.1f} s) -> item {iid}")
+        except Exception as e:  # noqa: BLE001
+            log(f"job {jid} failed: {e!r}")
+            c = db(); c.execute("UPDATE jobs SET status='failed', error=? WHERE id=?", (str(e)[-800:], jid)); c.commit(); c.close()
+
+
 # ----------------------------------------------------------------------------- web
 CSS = """
 :root{color-scheme:dark;--bg:#0f1115;--card:#171a21;--fg:#e8e8ea;--mut:#9aa0ad;--acc:#4cc2ff}
@@ -368,13 +541,35 @@ table.kv{width:100%;border-collapse:collapse;margin-top:10px;font-size:14px}tabl
 .nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 10px}.nav .btn{margin:0;font-size:15px;padding:10px 14px}.chip.home{background:#1d2130;color:var(--fg);font-weight:600}
 .strip{width:100%;border-radius:8px;margin-top:10px}.pager{display:flex;justify-content:center;gap:10px;padding:16px}.stats{color:var(--mut);font-size:13px;padding:0 14px}
 pre.prompt{white-space:pre-wrap;background:#0b0d11;padding:10px;border-radius:8px;font:14px/1.45 ui-monospace,Menlo,monospace}
+.card.sel{outline:3px solid var(--acc)}.card .ck{position:absolute;bottom:52px;right:8px;width:24px;height:24px;border-radius:50%;background:#000a;border:2px solid #fff;display:none;align-items:center;justify-content:center;font-size:14px}body.selmode .card .ck{display:flex}.card.sel .ck{background:var(--acc);color:#000;border-color:var(--acc)}
+#tray{position:fixed;left:0;right:0;bottom:0;background:#171a21f2;border-top:1px solid #2a2f3a;padding:10px 14px calc(10px + env(safe-area-inset-bottom));display:none;gap:10px;align-items:center;z-index:9}#tray.on{display:flex}#tray .n{flex:1}
+.btn.primary{background:var(--acc);color:#000;font-weight:600}.btn.danger{background:#3a1d1d}
+.rows{display:flex;flex-direction:column;gap:8px;padding:0 0 100px}.row{display:grid;grid-template-columns:96px 1fr;gap:10px;background:var(--card);border-radius:10px;padding:8px}.row img{width:96px;aspect-ratio:16/9;object-fit:cover;border-radius:6px;background:#000}
+.row .ttl{font-size:13px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.row .ctl{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px}.row input[type=number]{width:72px;background:#0b0d11;color:var(--fg);border:1px solid #2a2f3a;border-radius:6px;padding:6px;font-size:15px}
+.sbtn{padding:7px 10px;border-radius:8px;background:#1d2130;color:var(--fg);border:0;font-size:14px}.sbtn:active{background:#2a3044}
+.opts{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;background:var(--card);border-radius:10px;padding:12px;margin:10px 0}.opts label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--mut)}.opts input,.opts select{background:#0b0d11;color:var(--fg);border:1px solid #2a2f3a;border-radius:6px;padding:8px;font-size:15px}
+.bar{height:14px;background:#0b0d11;border-radius:999px;overflow:hidden;margin:10px 0}.bar i{display:block;height:100%;background:var(--acc);width:0;transition:width .4s}
+#pv{width:100%;max-height:50vh;background:#000;border-radius:10px;margin-bottom:10px}
+"""
+
+
+TRAY_JS = r"""
+const SM={key:'sm.sel',get(){try{return JSON.parse(localStorage.getItem(this.key)||'[]')}catch(e){return[]}},set(a){localStorage.setItem(this.key,JSON.stringify(a));this.paint()},
+ toggle(id){const a=this.get();const i=a.indexOf(id);if(i>=0)a.splice(i,1);else a.push(id);this.set(a)},has(id){return this.get().includes(id)},
+ paint(){const a=this.get();const t=document.getElementById('tray');if(!t)return;document.getElementById('trayN').textContent=a.length;t.classList.toggle('on',a.length>0);
+  document.getElementById('trayGo').href='/studio?ids='+a.join(',');document.querySelectorAll('.card[data-id]').forEach(c=>c.classList.toggle('sel',a.includes(+c.dataset.id)))}};
+document.addEventListener('DOMContentLoaded',()=>{SM.paint();const tc=document.getElementById('trayClear');if(tc)tc.onclick=e=>{e.preventDefault();SM.set([])};
+ const sel=document.getElementById('selmode');if(sel){sel.onclick=e=>{e.preventDefault();document.body.classList.toggle('selmode');sel.classList.toggle('on')}}
+ document.querySelectorAll('.card[data-id]').forEach(c=>c.addEventListener('click',e=>{if(document.body.classList.contains('selmode')){e.preventDefault();SM.toggle(+c.dataset.id)}}));
+ document.querySelectorAll('[data-addsel]').forEach(b=>b.addEventListener('click',e=>{e.preventDefault();const id=+b.dataset.addsel;if(!SM.has(id))SM.toggle(id);b.textContent='✓ In Studio tray ('+SM.get().length+')'}));});
 """
 
 
 def page(title: str, body: str, q: str = "", kind: str = "", project: str = "", tier: str = "", projects: list[str] | None = None, stats: str = "") -> str:
     qs = lambda **kw: "?" + urllib.parse.urlencode({k: v for k, v in {"q": q, "kind": kind, "project": project, "tier": tier, **kw}.items() if v})  # noqa: E731
     chips = "".join(f'<a class="chip{" on" if kind == k else ""}" href="{qs(kind=k)}">{lbl}</a>' for k, lbl in (("", "All"), ("video", "Video"), ("image", "Photos")))
-    chips += "".join(f'<a class="chip{" on" if tier == t else ""}" href="{qs(tier=t)}">{t}</a>' for t in ("full", "draft", "chain", "ab", "proof"))
+    chips += "".join(f'<a class="chip{" on" if tier == t else ""}" href="{qs(tier=t)}">{t}</a>' for t in ("full", "draft", "chain", "ab", "proof", "compile"))
+    chips += '<a class="chip" id="selmode" href="#">☑ Select</a><a class="chip" href="/studio">✂ Studio</a>'
     opts = "".join(f'<option value="{html.escape(p)}"{" selected" if p == project else ""}>{html.escape(p)}</option>' for p in (projects or []))
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>{html.escape(title)}</title><style>{CSS}</style></head><body>
@@ -382,7 +577,7 @@ def page(title: str, body: str, q: str = "", kind: str = "", project: str = "", 
 <input type="search" name="q" placeholder="search prompts, captions, paths" value="{html.escape(q)}">
 <select name="project" onchange="this.form.submit()"><option value="">all projects</option>{opts}</select>
 <input type="hidden" name="kind" value="{html.escape(kind)}"><input type="hidden" name="tier" value="{html.escape(tier)}"></form>
-<div class="chips">{chips}</div></header><div class="stats">{stats}</div>{body}</body></html>"""
+<div class="chips">{chips}</div></header><div class="stats">{stats}</div>{body}<div id="tray"><span class="n"><b id="trayN">0</b> selected</span><a class="btn primary" id="trayGo" href="/studio">Open Studio</a><a class="btn" href="#" id="trayClear">Clear</a></div><script>{TRAY_JS}</script></body></html>"""
 
 
 def fmt_dur(d: float | None) -> str:
@@ -413,7 +608,7 @@ def render_gallery(c: sqlite3.Connection, q: str, kind: str, project: str, tier:
     cards = []
     for r in rows:
         badge = fmt_dur(r["duration"]) if r["kind"] == "video" else f'{r["width"] or "?"}×{r["height"] or "?"}'
-        cards.append(f'<a class="card" href="/item/{r["id"]}"><img loading="lazy" src="/thumb/{r["sha12"]}.jpg" alt=""><span class="b">{badge}</span>'
+        cards.append(f'<a class="card" data-id="{r["id"]}" href="/item/{r["id"]}"><img loading="lazy" src="/thumb/{r["sha12"]}.jpg" alt=""><span class="b">{badge}</span><span class="ck">✓</span>'
                      f'<span class="t">{html.escape(r["tier"] or "")}</span><div class="m">{html.escape((r["created_at"] or "")[:16].replace("T", " "))} · {html.escape(r["project"] or "")}</div>'
                      f'<div class="p">{html.escape((r["prompt"] or r["caption"] or r["orig_path"].rsplit("/", 1)[-1])[:140])}</div></a>')
     base = urllib.parse.urlencode({k: v for k, v in {"q": q, "kind": kind, "project": project, "tier": tier}.items() if v})
@@ -442,9 +637,74 @@ def render_item(c: sqlite3.Connection, item_id: int) -> str | None:
             f'<a class="btn" href="/">⌂ Home</a><a class="btn" href="/?project={urllib.parse.quote(r["project"] or "")}">{html.escape(r["project"] or "project")}</a></div>'
             f'{media}{strip}<div><a class="btn" href="{src}" download>Download</a>'
             f'<a class="btn" href="javascript:navigator.clipboard.writeText(document.getElementById(\'pr\').innerText)">Copy prompt</a>'
-            f'<a class="btn" href="/?project={urllib.parse.quote(r["project"] or "")}">More from {html.escape(r["project"] or "project")}</a></div>'
+            f'<a class="btn" href="/?project={urllib.parse.quote(r["project"] or "")}">More from {html.escape(r["project"] or "project")}</a>'
+            f'<a class="btn primary" href="#" data-addsel="{r["id"]}">＋ Add to Studio</a>'
+            + (f'<a class="btn" href="/studio?from={r["id"]}">✂ Re-edit this compile</a>' if r["tier"] == "compile" and meta.get("spec") else "") + '</div>'
             f'<pre class="prompt" id="pr">{html.escape(r["prompt"] or "(no prompt recorded)")}</pre><table class="kv">{rows}</table></div>')
     return page(f"Spark Media · {r['sha12']}", body)
+
+
+STUDIO_JS = r"""
+const q=new URLSearchParams(location.search);let clips=[];let opts={title:'',transition:'fade',xfade:0.4,fade_ends:0.3,size:'auto',mute:false};
+async function load(){let ids=(q.get('ids')||'').split(',').filter(Boolean).map(Number);const from=q.get('from');
+ if(from){const r=await fetch('/api/items/by-ids?ids='+from);const it=(await r.json())[0];const sp=it&&it.meta&&it.meta.spec;if(sp){clips=sp.clips.map(c=>({...c}));Object.assign(opts,{title:sp.title||'',transition:sp.transition||'fade',xfade:sp.xfade||0.4,fade_ends:sp.fade_ends||0,size:sp.size||'auto',mute:!!sp.mute});ids=clips.map(c=>c.id)}}
+ if(!ids.length)ids=SM.get();if(!clips.length)clips=ids.map(id=>({id}));
+ if(!ids.length){document.getElementById('rows').innerHTML='<p>No clips yet. Go <a href="/">Home</a>, tap <b>☑ Select</b>, tap clips, then <b>Open Studio</b>.</p>';return}
+ const r=await fetch('/api/items/by-ids?ids='+ids.join(','));const items=await r.json();const by={};items.forEach(i=>by[i.id]=i);clips=clips.filter(c=>by[c.id]).map(c=>({...c,item:by[c.id]}));paint()}
+function fmt(x){return x==null||x===''?'':(+x).toFixed(1)}
+function paint(){const o=document.getElementById('rows');o.innerHTML='';clips.forEach((c,i)=>{const it=c.item;const vid=it.kind==='video';const d=document.createElement('div');d.className='row';
+ d.innerHTML=`<img src="/thumb/${it.sha12}.jpg"><div><div class="ttl">#${it.id} · ${vid?(it.duration||0).toFixed(1)+' s':'photo'} · ${(it.prompt||it.caption||'').slice(0,80)}</div>
+ <div class="ctl">${vid?`in <input type=number step=0.1 min=0 value="${fmt(c.in)}" data-k=in placeholder=0> out <input type=number step=0.1 min=0 value="${fmt(c.out)}" data-k=out placeholder="${(it.duration||0).toFixed(1)}">
+ <button class=sbtn data-a=pv>▶ preview</button><button class=sbtn data-a=setin>set in</button><button class=sbtn data-a=setout>set out</button>`:`still <input type=number step=0.5 min=0.5 value="${fmt(c.still||3)}" data-k=still> s`}
+ <button class=sbtn data-a=up>↑</button><button class=sbtn data-a=down>↓</button><button class=sbtn data-a=rm>✕</button></div></div>`;
+ d.querySelectorAll('input').forEach(inp=>inp.onchange=()=>{c[inp.dataset.k]=inp.value===''?null:+inp.value});
+ d.querySelectorAll('button').forEach(b=>b.onclick=()=>{const a=b.dataset.a;const pv=document.getElementById('pv');
+  if(a==='up'&&i>0){[clips[i-1],clips[i]]=[clips[i],clips[i-1]];paint()}else if(a==='down'&&i<clips.length-1){[clips[i+1],clips[i]]=[clips[i],clips[i+1]];paint()}
+  else if(a==='rm'){clips.splice(i,1);paint()}else if(a==='pv'){pv.src='/media/'+it.sha12+it.ext;pv.currentTime=c.in||0;pv.play();pv.dataset.i=i}
+  else if(a==='setin'||a==='setout'){if(+pv.dataset.i!==i){pv.src='/media/'+it.sha12+it.ext;pv.dataset.i=i;return}c[a==='setin'?'in':'out']=+pv.currentTime.toFixed(2);paint()}});
+ o.appendChild(d)});
+ const sum=clips.reduce((s,c)=>s+(c.item.kind==='video'?Math.max(0,(c.out||c.item.duration||0)-(c.in||0)):(c.still||3)),0);
+ document.getElementById('total').textContent=clips.length+' clips · ~'+sum.toFixed(1)+' s'+(opts.transition==='fade'&&clips.length>1?' (minus '+((clips.length-1)*opts.xfade).toFixed(1)+' s of crossfades)':'');
+ ['title','transition','xfade','fade_ends','size'].forEach(k=>{const e=document.getElementById('o_'+k);if(e)e.value=opts[k]});document.getElementById('o_mute').checked=opts.mute}
+document.addEventListener('DOMContentLoaded',()=>{load();['title','transition','xfade','fade_ends','size'].forEach(k=>document.getElementById('o_'+k).onchange=e=>{opts[k]=e.target.value;if(k!=='title'&&k!=='size'&&k!=='transition')opts[k]=+opts[k];paint()});
+ document.getElementById('o_mute').onchange=e=>opts.mute=e.target.checked;
+ document.getElementById('go').onclick=async()=>{if(!clips.length)return;const spec={...opts,clips:clips.map(c=>({id:c.id,in:c.in||null,out:c.out||null,still:c.still||null}))};
+  const r=await fetch('/api/compile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(spec)});const j=await r.json();if(j.job){SM.set([]);location.href='/job/'+j.job}else alert(j.error||'failed')}});
+"""
+
+JOB_JS = r"""
+const jid=location.pathname.split('/').pop();async function tick(){const r=await fetch('/api/job/'+jid);const j=await r.json();
+ document.getElementById('st').textContent=j.status+(j.error?' — '+j.error:'');document.querySelector('.bar i').style.width=Math.round((j.progress||0)*100)+'%';
+ document.getElementById('pct').textContent=Math.round((j.progress||0)*100)+'%';if(j.status==='done'&&j.item_id){document.getElementById('done').innerHTML='<a class="btn primary" href="/item/'+j.item_id+'">▶ Open the compiled clip</a> <a class="btn" href="/studio?from='+j.item_id+'">✂ Re-edit</a>';return}
+ if(j.status==='failed')return;setTimeout(tick,1000)}document.addEventListener('DOMContentLoaded',tick);
+"""
+
+
+def render_studio() -> str:
+    body = ('<div class="detail"><div class="nav"><a class="btn" href="/">⌂ Home</a><span class="btn" id="total">…</span></div>'
+            '<video id="pv" controls playsinline preload="metadata"></video><div class="rows" id="rows">loading…</div>'
+            '<div class="opts"><label>Title<input id="o_title" placeholder="my cut"></label>'
+            '<label>Transition<select id="o_transition"><option value="fade">crossfade</option><option value="cut">hard cut</option></select></label>'
+            '<label>Crossfade (s)<input id="o_xfade" type="number" step="0.1" min="0.1" max="2"></label>'
+            '<label>Fade in/out at ends (s)<input id="o_fade_ends" type="number" step="0.1" min="0" max="3"></label>'
+            '<label>Output size<select id="o_size"><option value="auto">auto (largest clip)</option><option value="768x448">768×448</option><option value="1280x704">1280×704</option><option value="1920x1080">1920×1080</option></select></label>'
+            '<label>Audio<span><input id="o_mute" type="checkbox"> mute all</span></label></div>'
+            '<div style="padding-bottom:90px"><a class="btn primary" href="#" id="go" style="font-size:17px;padding:12px 18px">⚙ Compile</a> '
+            '<span style="color:var(--mut);font-size:13px">clips are trimmed, scaled to one size at 24 fps, joined, and the result lands in the library (tier compile)</span></div></div>'
+            f"<script>{STUDIO_JS}</script>")
+    return page("Spark Media · Studio", body)
+
+
+def render_job(c: sqlite3.Connection, jid: int) -> str | None:
+    j = c.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
+    if not j:
+        return None
+    spec = json.loads(j["spec"] or "{}")
+    body = (f'<div class="detail"><div class="nav"><a class="btn" href="/">⌂ Home</a><a class="btn" href="/studio">✂ Studio</a></div>'
+            f'<h2 style="margin:6px 0">Compile #{jid}: {html.escape(spec.get("title") or "")}</h2><p>status: <b id="st">{html.escape(j["status"])}</b> · <span id="pct">0%</span></p>'
+            f'<div class="bar"><i></i></div><div id="done"></div><p style="color:var(--mut);font-size:13px">{len(spec.get("clips", []))} clips · {html.escape(spec.get("transition", ""))}</p></div>'
+            f"<script>{JOB_JS}</script>")
+    return page(f"Spark Media · compile #{jid}", body)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -546,6 +806,24 @@ class Handler(BaseHTTPRequestHandler):
                 if p == "/api/items.json":
                     rows = [dict(r) for r in c.execute("SELECT id,sha12,kind,ext,project,tier,tags,prompt,caption,seed,steps,width,height,duration,created_at,elapsed_s,orig_path FROM items WHERE hidden=0 ORDER BY created_at DESC LIMIT ?", (int(g("limit", "200")),))]
                     return self._send(200, json.dumps(rows).encode(), "application/json")
+                if p == "/studio":
+                    return self._send(200, render_studio().encode())
+                if p.startswith("/job/"):
+                    out = render_job(c, int(p[5:]))
+                    return self._send(200, out.encode()) if out else self._send(404, b"no such job", "text/plain")
+                if p == "/api/job":
+                    pass
+                if p.startswith("/api/job/"):
+                    j = c.execute("SELECT id,status,progress,output,item_id,error,created_at FROM jobs WHERE id=?", (int(p[9:]),)).fetchone()
+                    return self._send(200, json.dumps(dict(j) if j else {"error": "no such job"}).encode(), "application/json")
+                if p == "/api/items/by-ids":
+                    ids = [int(x) for x in re.findall(r"\d+", g("ids"))][:200]
+                    rows = []
+                    for i in ids:
+                        r = c.execute("SELECT id,sha12,kind,ext,project,tier,prompt,caption,width,height,duration,created_at,meta FROM items WHERE id=?", (i,)).fetchone()
+                        if r:
+                            d = dict(r); d["meta"] = json.loads(d.get("meta") or "{}"); rows.append(d)
+                    return self._send(200, json.dumps(rows).encode(), "application/json")
                 if p == "/api/stats":
                     st = {k: v for k, v in c.execute("SELECT kind, count(*) FROM items GROUP BY kind")}
                     st["bytes"] = c.execute("SELECT coalesce(sum(bytes),0) FROM items").fetchone()[0]
@@ -560,10 +838,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urllib.parse.urlsplit(self.path)
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(min(n, 1 << 20)) or b"{}") if n else {}
+        except json.JSONDecodeError:
+            return self._send(400, b"bad json", "text/plain")
+        if u.path == "/api/compile":
+            try:
+                clips = [c for c in body.get("clips", []) if isinstance(c, dict) and str(c.get("id", "")).isdigit()]
+                if not clips or len(clips) > 60:
+                    return self._send(400, json.dumps({"error": "1-60 clips"}).encode(), "application/json")
+                spec = {"title": str(body.get("title") or "")[:80], "clips": [{"id": int(c["id"]), "in": c.get("in"), "out": c.get("out"), "still": c.get("still")} for c in clips],
+                        "transition": "fade" if body.get("transition") == "fade" else "cut", "xfade": float(body.get("xfade") or 0.4),
+                        "fade_ends": float(body.get("fade_ends") or 0), "size": str(body.get("size") or "auto")[:12], "mute": bool(body.get("mute"))}
+                c = db()
+                cur = c.execute("INSERT INTO jobs(created_at,status,spec) VALUES (?,?,?)", (dt.datetime.now().isoformat(timespec="seconds"), "queued", json.dumps(spec)))
+                c.commit(); jid = cur.lastrowid; c.close()
+                _job_wake.set()
+                return self._send(200, json.dumps({"job": jid}).encode(), "application/json")
+            except Exception as e:  # noqa: BLE001
+                return self._send(500, json.dumps({"error": repr(e)}).encode(), "application/json")
         if self.client_address[0] not in ("127.0.0.1", "::1"):
             return self._send(403, b"local only", "text/plain")
-        n = int(self.headers.get("Content-Length") or 0)
-        body = json.loads(self.rfile.read(n) or b"{}") if n else {}
         try:
             if u.path == "/api/ingest":
                 c = db()
@@ -588,6 +884,7 @@ def serve(port: int) -> None:
                 log(f"periodic scan failed: {e!r}")
             time.sleep(SCAN_EVERY_S)
     threading.Thread(target=loop, daemon=True, name="scan").start()
+    threading.Thread(target=jobs_loop, daemon=True, name="jobs").start()
     srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     srv.daemon_threads = True
     log(f"serving on :{port}, library {LIB}")
