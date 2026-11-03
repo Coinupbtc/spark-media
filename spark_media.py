@@ -891,6 +891,9 @@ def render_item(c: sqlite3.Connection, item_id: int) -> str | None:
     if not r:
         return None
     src = f"/media/{r['sha12']}{r['ext']}"
+    mime = mimetypes.guess_type("x" + r["ext"])[0] or "application/octet-stream"
+    save_lbl = "📲 Save to Photos" if r["kind"] in ("video", "image") else "📲 Save / Share"
+    https_base = (load_config().get("https_base") or "").rstrip("/")
     media = (f'<video controls playsinline preload="metadata" poster="/thumb/{r["sha12"]}.jpg" src="{src}"></video>' if r["kind"] == "video"
              else f'<img class="full" src="/thumb/{r["sha12"]}.jpg" alt=""><audio controls preload="metadata" src="{src}" style="width:100%;margin-top:8px"></audio>' if r["kind"] == "audio"
              else f'<img class="full" src="{src}" alt="">')
@@ -905,7 +908,7 @@ def render_item(c: sqlite3.Connection, item_id: int) -> str | None:
     strip = f'<img class="strip" src="/strip/{r["sha12"]}.jpg" alt="" onerror="this.remove()">' if r["kind"] == "video" else ""
     body = (f'<div class="detail"><div class="nav"><a class="btn" href="/" onclick="if(history.length>1){{history.back();return false}}">‹ Back</a>'
             f'<a class="btn" href="/">⌂ Home</a><a class="btn" href="/?project={urllib.parse.quote(r["project"] or "")}">{html.escape(r["project"] or "project")}</a></div>'
-            f'{media}{strip}<div><a class="btn" href="{src}" download>Download</a>'
+            f'{media}{strip}<div><a class="btn primary" id="savePh" href="{html.escape(https_base)}/item/{r["id"]}" data-src="{src}" data-name="spark-{r["id"]}-{r["sha12"]}{r["ext"]}" data-type="{mime}">{save_lbl}</a>'
             f'<a class="btn" href="javascript:navigator.clipboard.writeText(document.getElementById(\'pr\').innerText)">Copy prompt</a>'
             f'<a class="btn" href="/?project={urllib.parse.quote(r["project"] or "")}">More from {html.escape(r["project"] or "project")}</a>'
             f'<a class="btn primary" href="#" data-addsel="{r["id"]}" data-sha="{r["sha12"]}">＋ Add to film</a>'
@@ -913,7 +916,27 @@ def render_item(c: sqlite3.Connection, item_id: int) -> str | None:
             + (f'<a class="btn" href="/cast/{meta["cast_id"]}">🎭 {html.escape(str(meta.get("cast")))}</a>' if meta.get("cast_id") else "")
             + (f'<a class="btn" href="/cast?look={r["id"]}">🎭 Make a character from this</a>' if r["kind"] in ("video", "image") else "") + '</div>'
             f'<pre class="prompt" id="pr">{html.escape(r["prompt"] or "(no prompt recorded)")}</pre><table class="kv">{rows}</table></div>')
-    return page(f"Spark Media · {r['sha12']}", body)
+    return page(f"Spark Media · {r['sha12']}", body + f"<script>{SAVE_JS}</script>")
+
+
+# Save to Photos: iOS lets a page write to Photos only through the share sheet (navigator.share with a File -> "Save Video"/"Save Image"),
+# and only in a secure context. On plain http the button is a link to the same page on the tailnet HTTPS address (config https_base).
+# The file is fetched up front so the tap calls share() with the user gesture still live; if Safari still says NotAllowed, the next tap works.
+SAVE_JS = r"""
+(()=>{const b=document.getElementById('savePh');if(!b)return;const lbl=b.textContent;let file=null,busy=null;
+ const canFiles=()=>window.isSecureContext&&navigator.canShare&&navigator.share;
+ if(!window.isSecureContext){if(!/^https:/.test(b.href)){b.href=b.dataset.src;b.setAttribute('download',b.dataset.name)}return}
+ b.removeAttribute('href');b.setAttribute('role','button');b.style.cursor='pointer';
+ const prep=()=>busy||(busy=fetch(b.dataset.src).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.blob()})
+  .then(bl=>{file=new File([bl],b.dataset.name,{type:b.dataset.type});return file}).catch(e=>{busy=null;throw e}));
+ if(canFiles())prep().catch(()=>{});
+ const plain=()=>{const a=document.createElement('a');a.href=b.dataset.src;a.download=b.dataset.name;document.body.appendChild(a);a.click();a.remove()};
+ const share=async f=>{if(!navigator.canShare({files:[f]})){plain();return}try{await navigator.share({files:[f]});b.textContent=lbl}
+  catch(e){if(e.name==='AbortError'){b.textContent=lbl}else if(e.name==='NotAllowedError'){b.textContent='✓ Ready — tap again to save'}else{b.textContent=lbl;alert('Could not share: '+e.message)}}};
+ b.addEventListener('click',async e=>{e.preventDefault();if(!canFiles()){plain();return}
+  if(file){share(file);return}b.textContent='Getting the file…';try{share(await prep())}catch(err){b.textContent=lbl;alert('Could not load the file: '+err.message)}});
+})();
+"""
 
 
 STUDIO_JS = r"""
@@ -1238,7 +1261,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"job": jid}).encode(), "application/json")
             except Exception as e:  # noqa: BLE001
                 return self._send(500, json.dumps({"error": repr(e)}).encode(), "application/json")
-        if self.client_address[0] not in ("127.0.0.1", "::1"):
+        # the tailnet HTTPS front (tailscale serve) connects from 127.0.0.1, so a forwarded request is not local
+        proxied = any(self.headers.get(h) for h in ("X-Forwarded-For", "Forwarded", "Tailscale-User-Login", "X-Forwarded-Host"))
+        if self.client_address[0] not in ("127.0.0.1", "::1") or proxied:
             return self._send(403, b"local only", "text/plain")
         try:
             if u.path == "/api/ingest":

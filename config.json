@@ -1,5 +1,7 @@
 {
   "_doc": "Roots the scanner walks every 15 min. kinds: video and/or image. tier/label/tags are defaults per root; sidecars and path hints override tier.",
+  "https_base": "https://sparkmax-10ef.tail6cfceb.ts.net:8121",
+  "_https_doc": "tailnet HTTPS front (tailscale serve --https=8121 -> 127.0.0.1:8120); iOS Save to Photos needs a secure page",
   "roots": [
     {
       "path": "~/Documents/projects/MiniMax-H3-2x-DGX-Spark/output",
