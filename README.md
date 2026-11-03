@@ -42,3 +42,33 @@ Clips longer than 15 s still come from chaining at render time (`h3-long-chain.s
 Add a root: append `{"path": "~/...", "label": "name", "kinds": ["video","image"], "exclude": ["regex"]}` to
 `config.json`; the next scan picks it up. Metadata precedence per clip: sidecar JSON → twin-test `.txt` → `prompt.txt` →
 `gen.log` → Discord caption → filename prefix.
+
+## Cast — the same character, the same voice, every time (2026-11-03)
+
+Prompt-only series drift: two "same cartoon reggae singer" clips rendered minutes apart came out as two different people
+(different shirt, cap and stage). **Cast** (`/cast`) fixes that with two locks:
+
+- **Look lock.** A character is created from one library clip (or photo): its middle frame becomes the character's
+  reference frame. **🎥 Render shot** sends that frame as the first frame of a new MiniMax H3 render
+  (`h3-image2video.sh`, first-frame I2V on the maximus pair), so the face, outfit and stage carry over. Proof: a 4 s shot
+  from the singer's frame kept the same singer in every frame; render 136 s at 768×448.
+- **Voice lock.** Each character gets a Fish Audio Drama 3 voice (plotarmordev/drama-tensorfold on node4, started on
+  demand by `~/scripts/dgx/drama3.sh`, stopped after 5 idle minutes). The voice is bootstrapped from the model's own
+  built-in voice with a seed, then encoded into the catalog (`drama3-voice-encode.sh`, provenance `model-invented`), so
+  every later line is the same timbre. **🗣 Speak** makes a line (library item, tier `voice`, with a waveform thumbnail and
+  player); **🎬 Put it on the clip** lays a line over a clip at a chosen second: the line is loudness-normalised to −16 LUFS,
+  the clip's own sound ducks under it (sidechain compression), the video stream is copied byte-for-byte, and the result is
+  a library item (tier `voiced`).
+- **Every take is checked.** Drama's built-in voice sometimes returns half a second of sound and then silence (seed 7 and
+  seed 23 did, reproducibly); a voice encoded from such a take is silent forever. `take_quality()` measures voiced seconds,
+  the longest gap and the voiced share of every take (ffmpeg `silencedetect`); a rejected take is retried on the next seed
+  (8 tries for a voice, 4 for a line) and the seed that worked is stored on the character. **↻ re-make the voice** on a
+  character page rebuilds the voice from a new seed.
+
+Everything runs as background jobs (`jobs.kind` = `voice-create` / `say` / `mix` / `shot`), with the same progress page as
+films. API: `POST /api/cast {name, seed, look, ref_text}` · `POST /api/cast/<id>/say {text, seed}` ·
+`POST /api/cast/<id>/mix {line_id, clip_id, at, lufs}` · `POST /api/cast/<id>/shot {prompt, duration, seed, width, height}` ·
+`POST /api/cast/<id>/revoice {seed}`. Files: `~/media-library/cast/` (reference frames and takes, `lines/<name>/`,
+`mixed/`, `shots/<name>/`); voices live on node4 in `~/Documents/projects/drama-tensorfold/voices/`.
+Drama 3 weights are under the Fish Audio Community License (personal / small-commercial use; not a hosted service for
+third parties).

@@ -39,6 +39,7 @@ DB_PATH = LIB / "library.sqlite"
 STORE, THUMBS, STRIPS, LOGF = LIB / "store", LIB / "thumbs", LIB / "strips", HOME / "logs" / "spark-media.log"
 VIDEO_EXT = {".mp4", ".webm", ".mov", ".mkv", ".m4v"}
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+AUDIO_EXT = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
 SCAN_EVERY_S = 15 * 60
 REF_PROMPT = "Macro soldering a PCB under warm bench light, soft room tone."
 _log_lock = threading.Lock()
@@ -68,7 +69,8 @@ CREATE TABLE IF NOT EXISTS items (
 CREATE INDEX IF NOT EXISTS items_created ON items(created_at DESC);
 CREATE INDEX IF NOT EXISTS items_project ON items(project);
 CREATE TABLE IF NOT EXISTS seen (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, sha256 TEXT);
-CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, created_at TEXT, status TEXT, progress REAL DEFAULT 0, spec TEXT, output TEXT DEFAULT '', item_id INTEGER, log TEXT DEFAULT '', error TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, created_at TEXT, status TEXT, progress REAL DEFAULT 0, spec TEXT, output TEXT DEFAULT '', item_id INTEGER, log TEXT DEFAULT '', error TEXT DEFAULT '', kind TEXT DEFAULT 'compile');
+CREATE TABLE IF NOT EXISTS cast (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at TEXT, seed INTEGER, look_item INTEGER, ref_text TEXT DEFAULT '', voice_ok INTEGER DEFAULT 0, notes TEXT DEFAULT '');
 """
 
 
@@ -78,6 +80,10 @@ def db() -> sqlite3.Connection:
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
     c.executescript(SCHEMA)
+    try:
+        c.execute("ALTER TABLE jobs ADD COLUMN kind TEXT DEFAULT 'compile'")
+    except sqlite3.OperationalError:
+        pass
     try:
         c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(prompt, caption, orig_path, project, tags, content='items', content_rowid='id')")
         c.executescript("""
@@ -135,6 +141,14 @@ def image_size(path: Path) -> dict:
         return {}
 
 
+def audio_info(path: Path) -> dict:
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)], capture_output=True, text=True, timeout=30).stdout
+        return {"duration": round(float(json.loads(out or "{}").get("format", {}).get("duration", 0) or 0), 3)}
+    except (subprocess.SubprocessError, ValueError, json.JSONDecodeError):
+        return {}
+
+
 def make_thumbs(kind: str, src: Path, sha12: str, duration: float | None) -> None:
     THUMBS.mkdir(parents=True, exist_ok=True)
     STRIPS.mkdir(parents=True, exist_ok=True)
@@ -149,6 +163,10 @@ def make_thumbs(kind: str, src: Path, sha12: str, duration: float | None) -> Non
             subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-vf",
                             f"select='{sel}',scale=320:-2,tile=5x1", "-frames:v", "1", "-vsync", "vfr", "-q:v", "5", str(strip)],
                            capture_output=True, timeout=180)
+    elif kind == "audio":
+        if not thumb.exists():
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-filter_complex", "showwavespic=s=480x270:colors=#4cc2ff,format=yuvj420p", "-frames:v", "1", str(thumb)],
+                           capture_output=True, timeout=60)
     else:
         if not thumb.exists():
             try:
@@ -227,12 +245,12 @@ def guess_tier(path: str, tier: str) -> str:
 
 
 def ingest_file(c: sqlite3.Connection, path: Path, project: str = "", tier: str = "", tags: str = "", caption: str = "",
-                prompt: str = "", force_meta: bool = False) -> int | None:
+                prompt: str = "", force_meta: bool = False, extra: dict | None = None) -> int | None:
     path = path.resolve()
     if not path.is_file() or ".partial." in path.name:
         return None
     ext = path.suffix.lower()
-    kind = "video" if ext in VIDEO_EXT else "image" if ext in IMAGE_EXT else None
+    kind = "video" if ext in VIDEO_EXT else "image" if ext in IMAGE_EXT else "audio" if ext in AUDIO_EXT else None
     if kind is None:
         return None
     st = path.stat()
@@ -264,7 +282,7 @@ def ingest_file(c: sqlite3.Connection, path: Path, project: str = "", tier: str 
             os.link(path, store)
         except OSError:
             shutil.copy2(path, store)
-    info = ffprobe(store) if kind == "video" else image_size(store)
+    info = ffprobe(store) if kind == "video" else image_size(store) if kind == "image" else audio_info(store)
     make_thumbs(kind, store, sha12, info.get("duration"))
     final_prompt = prompt or meta.get("prompt") or pfx or ""
     psrc = "arg" if prompt else meta.get("prompt_source") or ("filename-prefix" if pfx else "")
@@ -275,7 +293,7 @@ def ingest_file(c: sqlite3.Connection, path: Path, project: str = "", tier: str 
          final_prompt, psrc, caption or meta.get("caption", ""), str(meta.get("seed", "") or ""), meta.get("steps"),
          info.get("width") or meta.get("width"), info.get("height") or meta.get("height"), info.get("duration"), info.get("fps"),
          st.st_size, created, dt.datetime.now().isoformat(timespec="seconds"), meta.get("elapsed_s"),
-         meta.get("model", "minimax-h3" if kind == "video" else ""), json.dumps({k: v for k, v in meta.items() if k not in ("prompt", "caption")})))
+         meta.get("model", "minimax-h3" if kind == "video" else ""), json.dumps({**{k: v for k, v in meta.items() if k not in ("prompt", "caption")}, **(extra or {})})))
     log(f"ingested {kind} {sha12} {path}")
     return cur.lastrowid
 
@@ -289,7 +307,7 @@ def scan(full: bool = False) -> dict:
         if not base.exists():
             continue
         kinds = set(root.get("kinds", ["video"]))
-        exts = (VIDEO_EXT if "video" in kinds else set()) | (IMAGE_EXT if "image" in kinds else set())
+        exts = (VIDEO_EXT if "video" in kinds else set()) | (IMAGE_EXT if "image" in kinds else set()) | (AUDIO_EXT if "audio" in kinds else set())
         excl = [re.compile(x) for x in root.get("exclude", [])]
         for p in base.rglob("*"):
             if not p.is_file() or p.suffix.lower() not in exts or ".partial." in p.name:
@@ -510,15 +528,257 @@ def jobs_loop() -> None:
         c = db(); c.execute("UPDATE jobs SET status='running', progress=0.02 WHERE id=?", (jid,)); c.commit(); c.close()
         try:
             spec = json.loads(job["spec"])
-            out, total, side = compile_spec(jid, spec, cb)
-            c = db()
-            iid = ingest_file(c, out, project="studio", tier="compile", caption=side["title"], prompt=side["prompt"])
-            c.execute("UPDATE jobs SET status='done', progress=1, output=?, item_id=? WHERE id=?", (str(out), iid, jid))
-            c.commit(); c.close()
-            log(f"job {jid} done: {out} ({total:.1f} s) -> item {iid}")
+            kind = job["kind"] if "kind" in job.keys() and job["kind"] else "compile"
+            if kind == "compile":
+                out, total, side = compile_spec(jid, spec, cb)
+                c = db()
+                iid = ingest_file(c, out, project="studio", tier="compile", caption=side["title"], prompt=side["prompt"])
+                c.execute("UPDATE jobs SET status='done', progress=1, output=?, item_id=? WHERE id=?", (str(out), iid, jid))
+                c.commit(); c.close()
+                log(f"job {jid} done: {out} ({total:.1f} s) -> item {iid}")
+            else:
+                res = JOB_KINDS[kind](jid, spec, cb)
+                c = db()
+                c.execute("UPDATE jobs SET status='done', progress=1, output=?, item_id=? WHERE id=?", (json.dumps(res), res.get("item_id"), jid))
+                c.commit(); c.close()
+                log(f"job {jid} ({kind}) done: {res}")
         except Exception as e:  # noqa: BLE001
             log(f"job {jid} failed: {e!r}")
             c = db(); c.execute("UPDATE jobs SET status='failed', error=? WHERE id=?", (str(e)[-800:], jid)); c.commit(); c.close()
+
+
+# ----------------------------------------------------------------------------- cast: characters with a look and a voice
+CAST_DIR = LIB / "cast"
+DRAMA = HOME / "scripts/dgx/drama3.sh"
+ENCODE = HOME / "scripts/dgx/drama3-voice-encode.sh"
+I2V = HOME / ".hermes/scripts/h3-image2video.sh"
+DRAMA_IDLE_STOP_S = 300
+_drama_last_use = 0.0
+_drama_started_by_us = False
+REF_TEXT = ("Good evening. This is {name}, speaking for the first time. The two Sparks are warm, the lights are low, and the render "
+            "queue is empty. Tell me what you want to make tonight, and I will walk you through it, step by step.")
+
+
+def sh(cmd: list[str], timeout: int = 900, env: dict | None = None, unset: tuple = ()) -> subprocess.CompletedProcess:
+    e = {k: v for k, v in {**os.environ, **(env or {})}.items() if k not in unset}
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=e)
+    if r.returncode != 0:
+        raise RuntimeError((r.stdout + r.stderr).strip()[-900:] or f"{cmd[0]} failed")
+    return r
+
+
+def drama_start() -> None:
+    global _drama_last_use, _drama_started_by_us
+    sh(["bash", str(DRAMA), "start"], timeout=400)
+    _drama_started_by_us = True
+    _drama_last_use = time.time()
+
+
+def drama_say(text: str, voice: str | None, seed: int | None, out: Path) -> Path:
+    global _drama_last_use
+    cmd = ["bash", str(DRAMA), "say", text, "--out", str(out)]
+    if voice:
+        cmd += ["--voice", voice]
+    if seed is not None:
+        cmd += ["--seed", str(int(seed))]
+    sh(cmd, timeout=900)
+    _drama_last_use = time.time()
+    if not out.exists():
+        raise RuntimeError("no audio produced")
+    return out
+
+
+def drama_stop() -> None:
+    global _drama_started_by_us
+    subprocess.run(["bash", str(DRAMA), "stop"], capture_output=True, text=True, timeout=120)
+    _drama_started_by_us = False
+
+
+def drama_idle_loop() -> None:
+    while True:
+        time.sleep(30)
+        if _drama_started_by_us and time.time() - _drama_last_use > DRAMA_IDLE_STOP_S:
+            try:
+                drama_stop()
+                log("drama3 stopped after idle")
+            except Exception as e:  # noqa: BLE001
+                log(f"drama idle stop failed: {e!r}")
+
+
+def take_quality(wav: Path, words: int) -> tuple[bool, str]:
+    """Drama's built-in voice sometimes returns a burst and then silence (seed 23 on 2026-11-03: 0.55 s of sound, 10 s of nothing).
+    Measure the take: voiced seconds, the longest gap, and the voiced share; reject before anything is encoded or mixed."""
+    try:
+        dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(wav)], capture_output=True, text=True, timeout=30).stdout.strip() or 0)
+        out = subprocess.run(["ffmpeg", "-v", "info", "-i", str(wav), "-af", "silencedetect=n=-40dB:d=0.3", "-f", "null", "-"], capture_output=True, text=True, timeout=60).stderr
+    except (subprocess.SubprocessError, ValueError) as e:
+        return False, f"analysis failed: {e!r}"
+    starts = [float(x) for x in re.findall(r"silence_start: ([0-9.]+)", out)]
+    ends = [float(x) for x in re.findall(r"silence_end: ([0-9.]+)", out)]
+    gaps = [(a, (ends[i] if i < len(ends) else dur)) for i, a in enumerate(starts)]
+    silent = sum(max(0.0, b - a) for a, b in gaps)
+    voiced, longest = max(0.0, dur - silent), max([b - a for a, b in gaps] or [0.0])
+    need = max(0.8, 0.12 * max(1, words))
+    ok = dur > 0 and voiced >= need and longest <= 2.0 and voiced / dur >= 0.45
+    return ok, f"{dur:.1f}s, voiced {voiced:.1f}s (need {need:.1f}), longest gap {longest:.1f}s, voiced share {voiced / dur if dur else 0:.0%}"
+
+
+def voice_exists(name: str) -> bool:
+    r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "spark4",
+                        f"test -s /home/coinupbtc/Documents/projects/drama-tensorfold/voices/{name}.json"], capture_output=True, timeout=30)
+    return r.returncode == 0
+
+
+def reference_frame(c: sqlite3.Connection, item_id: int, name: str) -> Path:
+    r = c.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+    if not r:
+        raise ValueError(f"look item {item_id} not in the library")
+    CAST_DIR.mkdir(parents=True, exist_ok=True)
+    out = CAST_DIR / f"{name}-ref.png"
+    if r["kind"] == "image":
+        from PIL import Image
+        with Image.open(r["store_path"]) as im:
+            im.convert("RGB").save(out)
+    else:
+        d = float(r["duration"] or 0)
+        sh(["ffmpeg", "-y", "-v", "error", "-ss", f"{d * 0.5:.2f}", "-i", r["store_path"], "-frames:v", "1", str(out)], timeout=120)
+    return out
+
+
+def job_voice_create(jid: int, spec: dict, cb) -> dict:
+    """Create a character's voice: a reference take from the built-in voice with a seed, encoded as model-invented."""
+    name, seed = spec["name"], int(spec.get("seed") or 7)
+    c = db()
+    row = c.execute("SELECT * FROM cast WHERE name=?", (name,)).fetchone()
+    c.close()
+    if not row:
+        raise ValueError("no such character")
+    if spec.get("force"):
+        subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "spark4", f"rm -f /home/coinupbtc/Documents/projects/drama-tensorfold/voices/{name}.json"], capture_output=True, timeout=30)
+        c = db(); c.execute("UPDATE cast SET voice_ok=0 WHERE id=?", (row["id"],)); c.commit(); c.close()
+    if voice_exists(name):
+        cb(0.9)
+    else:
+        CAST_DIR.mkdir(parents=True, exist_ok=True)
+        ref = CAST_DIR / f"{name}-ref.wav"
+        text = (row["ref_text"] or REF_TEXT).format(name=name.capitalize())
+        words = len(text.split())
+        cb(0.1); drama_start(); cb(0.3)
+        tried = []
+        for i in range(8):
+            take_seed = seed + i
+            drama_say(text, None, take_seed, ref)
+            ok, why = take_quality(ref, words)
+            tried.append(f"seed {take_seed}: {why}")
+            log(f"voice-create {name} seed {take_seed}: {'OK' if ok else 'REJECT'} {why}")
+            if ok:
+                seed = take_seed
+                break
+            cb(0.3 + 0.03 * i)
+        else:
+            drama_stop()
+            raise RuntimeError("no usable reference take in 8 seeds: " + " | ".join(tried))
+        cb(0.6); drama_stop(); cb(0.7)
+        sh(["bash", str(ENCODE), name, str(ref), text, "model-invented", f"Drama 3 built-in voice, seed {seed}, Spark Media cast {dt.date.today()}"], timeout=600)
+        cb(0.95)
+    c = db(); c.execute("UPDATE cast SET voice_ok=1, seed=? WHERE id=?", (seed, row["id"])); c.commit(); c.close()
+    return {"voice": name, "seed": seed}
+
+
+def job_say(jid: int, spec: dict, cb) -> dict:
+    c = db(); ch = c.execute("SELECT * FROM cast WHERE id=?", (int(spec["cast_id"]),)).fetchone(); c.close()
+    if not ch:
+        raise ValueError("no such character")
+    text = str(spec["text"]).strip()[:4000]
+    seed = int(spec.get("seed") or ch["seed"] or 7)
+    out_dir = CAST_DIR / "lines" / ch["name"]; out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}-{re.sub(r'[^A-Za-z0-9]+', '_', text)[:40].strip('_')}.wav"
+    cb(0.1); drama_start(); cb(0.4)
+    words = len(text.split())
+    for i in range(4):
+        drama_say(text, ch["name"] if ch["voice_ok"] else None, seed + i, out)
+        ok, why = take_quality(out, words)
+        log(f"say {ch['name']} seed {seed + i}: {'OK' if ok else 'REJECT'} {why}")
+        if ok:
+            seed += i
+            break
+    else:
+        out.unlink(missing_ok=True)
+        raise RuntimeError(f"four takes came back mostly silent (last: {why}); re-make this character's voice and try again")
+    cb(0.9)
+    (out.parent / (out.name + ".json")).write_text(json.dumps({"tool": "spark-media cast", "tier": "voice", "prompt": text, "seed": seed, "cast": ch["name"], "cast_id": ch["id"], "take": why}, indent=1))
+    c = db(); iid = ingest_file(c, out, project="cast", tier="voice", caption=f"{ch['name']}: {text}", prompt=text, extra={"cast": ch["name"], "cast_id": ch["id"], "seed": seed}); c.commit(); c.close()
+    return {"item_id": iid, "seed": seed}
+
+
+def job_mix(jid: int, spec: dict, cb) -> dict:
+    """Lay a spoken line over a clip: duck the clip's audio under the line (house recipe), keep the video as is."""
+    c = db()
+    clip = c.execute("SELECT * FROM items WHERE id=?", (int(spec["clip_id"]),)).fetchone()
+    line = c.execute("SELECT * FROM items WHERE id=?", (int(spec["line_id"]),)).fetchone()
+    c.close()
+    if not clip or clip["kind"] != "video" or not line or line["kind"] != "audio":
+        raise ValueError("need a video clip and an audio line from the library")
+    at = max(0.0, float(spec.get("at") or 0)); ms = int(at * 1000)
+    clip_dur = float(clip["duration"] or 0) or float(ffprobe(Path(clip["store_path"])).get("duration") or 0)
+    if clip_dur <= 0:
+        raise ValueError("could not read the clip's duration")
+    lufs = float(spec.get("lufs") or -16)
+    out_dir = CAST_DIR / "mixed"; out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}-clip{clip['id']}-line{line['id']}.mp4"
+    cb(0.2)
+    if has_audio(Path(clip["store_path"])):
+        graph = (f"[1:a]loudnorm=I={lufs}:TP=-1.5:LRA=11,aformat=sample_rates=48000:channel_layouts=stereo,adelay={ms}|{ms},apad=whole_dur={clip_dur:.3f},atrim=0:{clip_dur:.3f},asplit[l1][l2];"
+                 f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo[bed];[bed][l2]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[duck];"
+                 f"[duck][l1]amix=inputs=2:normalize=0:duration=first[a]")
+    else:
+        graph = f"[1:a]loudnorm=I={lufs}:TP=-1.5:LRA=11,aformat=sample_rates=48000:channel_layouts=stereo,adelay={ms}|{ms},apad=whole_dur={clip_dur:.3f},atrim=0:{clip_dur:.3f}[a]"
+    sh(["ffmpeg", "-y", "-v", "error", "-i", clip["store_path"], "-i", line["store_path"], "-filter_complex", graph, "-map", "0:v", "-map", "[a]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-t", f"{clip_dur:.3f}", "-movflags", "+faststart", str(out)], timeout=900)
+    cb(0.9)
+    meta = json.loads(line["meta"] or "{}")
+    cap = f"{meta.get('cast', 'voice')} over #{clip['id']}: {line['prompt'] or line['caption']}"
+    (out.parent / (out.name + ".json")).write_text(json.dumps({"tool": "spark-media cast mix", "tier": "voiced", "prompt": clip["prompt"], "caption": cap, "spec": spec,
+                                                               "cast": meta.get("cast"), "cast_id": meta.get("cast_id")}, indent=1))
+    c = db(); iid = ingest_file(c, out, project="cast", tier="voiced", caption=cap, prompt=clip["prompt"] or "", extra={"cast": meta.get("cast"), "cast_id": meta.get("cast_id"), "spec": spec}); c.commit(); c.close()
+    return {"item_id": iid}
+
+
+def job_shot(jid: int, spec: dict, cb) -> dict:
+    """A new shot that starts from the character's reference frame (first-frame I2V), so the look carries over."""
+    c = db(); ch = c.execute("SELECT * FROM cast WHERE id=?", (int(spec["cast_id"]),)).fetchone()
+    if not ch or not ch["look_item"]:
+        c.close(); raise ValueError("this character has no look clip yet")
+    ref = reference_frame(c, int(ch["look_item"]), ch["name"]); c.close()
+    cb(0.1)
+    out_dir = CAST_DIR / "shots" / ch["name"]; out_dir.mkdir(parents=True, exist_ok=True)
+    before = set(out_dir.glob("h3i2v-*.mp4"))
+    env = {"H3_OUT_DIR": str(out_dir), "H3_DURATION": str(int(spec.get("duration") or 4)), "H3_WIDTH": str(int(spec.get("width") or 768)),
+           "H3_HEIGHT": str(int(spec.get("height") or 448)), "H3_SEED": str(int(spec.get("seed") or ch["seed"] or 7))}
+    t0 = time.time()
+    r = sh(["bash", str(I2V), str(ref), str(spec["prompt"])], timeout=3600, env=env, unset=("H3_API_BASE", "H3_TURBO", "H3_LORA_REQ", "H3_LORA_FILE"))
+    cb(0.9)
+    new = [p for p in out_dir.glob("h3i2v-*.mp4") if p not in before]
+    if not new:
+        raise RuntimeError("render finished but no h3i2v-*.mp4 appeared: " + (r.stdout + r.stderr)[-300:])
+    out = max(new, key=lambda p: p.stat().st_mtime)
+    (out.parent / (out.name + ".json")).write_text(json.dumps({"tool": "spark-media cast shot (first-frame i2v)", "tier": "shot", "prompt": spec["prompt"], "seed": env["H3_SEED"],
+                                                               "duration": int(env["H3_DURATION"]), "elapsed_s": round(time.time() - t0, 1), "cast": ch["name"], "cast_id": ch["id"],
+                                                               "reference_frame": str(ref), "look_item": ch["look_item"]}, indent=1))
+    c = db(); iid = ingest_file(c, out, project="cast", tier="shot", caption=f"{ch['name']}: {spec['prompt'][:80]}", prompt=str(spec["prompt"]),
+                                extra={"cast": ch["name"], "cast_id": ch["id"], "look_item": ch["look_item"]}); c.commit(); c.close()
+    return {"item_id": iid}
+
+
+JOB_KINDS = {"voice-create": job_voice_create, "say": job_say, "mix": job_mix, "shot": job_shot}
+
+
+def queue_job(kind: str, spec: dict) -> int:
+    c = db()
+    cur = c.execute("INSERT INTO jobs(created_at,status,spec,kind) VALUES (?,?,?,?)", (dt.datetime.now().isoformat(timespec="seconds"), "queued", json.dumps(spec), kind))
+    c.commit(); jid = cur.lastrowid; c.close()
+    _job_wake.set()
+    return jid
 
 
 # ----------------------------------------------------------------------------- web
@@ -550,6 +810,7 @@ pre.prompt{white-space:pre-wrap;background:#0b0d11;padding:10px;border-radius:8p
 .row .ttl{font-size:13px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.row .ctl{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px}.row input[type=number]{width:72px;background:#0b0d11;color:var(--fg);border:1px solid #2a2f3a;border-radius:6px;padding:6px;font-size:15px}
 .sbtn{padding:7px 10px;border-radius:8px;background:#1d2130;color:var(--fg);border:0;font-size:14px}.sbtn:active{background:#2a3044}
 .opts{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;background:var(--card);border-radius:10px;padding:12px;margin:10px 0}.opts label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--mut)}.opts input,.opts select{background:#0b0d11;color:var(--fg);border:1px solid #2a2f3a;border-radius:6px;padding:8px;font-size:15px}
+.ccards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin:10px 0}.ccard{background:var(--card);border-radius:10px;overflow:hidden;color:var(--fg);text-decoration:none}.ccard img{width:100%;aspect-ratio:1;object-fit:cover;display:block;background:#000}.ccard div{padding:8px}.noimg{aspect-ratio:1;display:flex;align-items:center;justify-content:center;color:var(--mut)}.mut{color:var(--mut)}textarea{background:#0b0d11;color:var(--fg);border:1px solid #2a2f3a;border-radius:6px;padding:8px;font-size:15px;width:100%}
 .bar{height:14px;background:#0b0d11;border-radius:999px;overflow:hidden;margin:10px 0}.bar i{display:block;height:100%;background:var(--acc);width:0;transition:width .4s}
 #pv{width:100%;max-height:50vh;background:#000;border-radius:10px;margin-bottom:10px}
 """
@@ -575,9 +836,9 @@ document.addEventListener('DOMContentLoaded',()=>{SM.paint();const tc=document.g
 
 def page(title: str, body: str, q: str = "", kind: str = "", project: str = "", tier: str = "", projects: list[str] | None = None, stats: str = "") -> str:
     qs = lambda **kw: "?" + urllib.parse.urlencode({k: v for k, v in {"q": q, "kind": kind, "project": project, "tier": tier, **kw}.items() if v})  # noqa: E731
-    chips = "".join(f'<a class="chip{" on" if kind == k else ""}" href="{qs(kind=k)}">{lbl}</a>' for k, lbl in (("", "All"), ("video", "Video"), ("image", "Photos")))
+    chips = "".join(f'<a class="chip{" on" if kind == k else ""}" href="{qs(kind=k)}">{lbl}</a>' for k, lbl in (("", "All"), ("video", "Video"), ("image", "Photos"), ("audio", "Lines")))
     chips += "".join(f'<a class="chip{" on" if tier == t else ""}" href="{qs(tier=t)}">{t}</a>' for t in ("full", "draft", "chain", "ab", "proof", "compile"))
-    chips += '<a class="chip" href="/studio" title="trim and fine-tune">✂ Fine-tune</a>'
+    chips += '<a class="chip" href="/studio" title="trim and fine-tune">✂ Fine-tune</a><a class="chip" href="/cast">🎭 Cast</a>'
     opts = "".join(f'<option value="{html.escape(p)}"{" selected" if p == project else ""}>{html.escape(p)}</option>' for p in (projects or []))
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>{html.escape(title)}</title><style>{CSS}</style></head><body>
@@ -615,7 +876,7 @@ def render_gallery(c: sqlite3.Connection, q: str, kind: str, project: str, tier:
     projects = [r[0] for r in c.execute("SELECT DISTINCT project FROM items WHERE hidden=0 ORDER BY project")]
     cards = []
     for r in rows:
-        badge = fmt_dur(r["duration"]) if r["kind"] == "video" else f'{r["width"] or "?"}×{r["height"] or "?"}'
+        badge = fmt_dur(r["duration"]) if r["kind"] in ("video", "audio") else f'{r["width"] or "?"}×{r["height"] or "?"}'
         cards.append(f'<a class="card" data-id="{r["id"]}" data-sha="{r["sha12"]}" href="/item/{r["id"]}"><img loading="lazy" src="/thumb/{r["sha12"]}.jpg" alt=""><span class="b">{badge}</span><button class="add" type="button" aria-label="add to film">＋</button>'
                      f'<span class="t">{html.escape(r["tier"] or "")}</span><div class="m">{html.escape((r["created_at"] or "")[:16].replace("T", " "))} · {html.escape(r["project"] or "")}</div>'
                      f'<div class="p">{html.escape((r["prompt"] or r["caption"] or r["orig_path"].rsplit("/", 1)[-1])[:140])}</div></a>')
@@ -631,6 +892,7 @@ def render_item(c: sqlite3.Connection, item_id: int) -> str | None:
         return None
     src = f"/media/{r['sha12']}{r['ext']}"
     media = (f'<video controls playsinline preload="metadata" poster="/thumb/{r["sha12"]}.jpg" src="{src}"></video>' if r["kind"] == "video"
+             else f'<img class="full" src="/thumb/{r["sha12"]}.jpg" alt=""><audio controls preload="metadata" src="{src}" style="width:100%;margin-top:8px"></audio>' if r["kind"] == "audio"
              else f'<img class="full" src="{src}" alt="">')
     meta = json.loads(r["meta"] or "{}")
     kv = [("created", (r["created_at"] or "").replace("T", " ")), ("project", r["project"]), ("tier", r["tier"]), ("tags", r["tags"]),
@@ -647,7 +909,9 @@ def render_item(c: sqlite3.Connection, item_id: int) -> str | None:
             f'<a class="btn" href="javascript:navigator.clipboard.writeText(document.getElementById(\'pr\').innerText)">Copy prompt</a>'
             f'<a class="btn" href="/?project={urllib.parse.quote(r["project"] or "")}">More from {html.escape(r["project"] or "project")}</a>'
             f'<a class="btn primary" href="#" data-addsel="{r["id"]}" data-sha="{r["sha12"]}">＋ Add to film</a>'
-            + (f'<a class="btn" href="/studio?from={r["id"]}">✂ Re-edit this compile</a>' if r["tier"] == "compile" and meta.get("spec") else "") + '</div>'
+            + (f'<a class="btn" href="/studio?from={r["id"]}">✂ Re-edit this compile</a>' if r["tier"] == "compile" and meta.get("spec") else "")
+            + (f'<a class="btn" href="/cast/{meta["cast_id"]}">🎭 {html.escape(str(meta.get("cast")))}</a>' if meta.get("cast_id") else "")
+            + (f'<a class="btn" href="/cast?look={r["id"]}">🎭 Make a character from this</a>' if r["kind"] in ("video", "image") else "") + '</div>'
             f'<pre class="prompt" id="pr">{html.escape(r["prompt"] or "(no prompt recorded)")}</pre><table class="kv">{rows}</table></div>')
     return page(f"Spark Media · {r['sha12']}", body)
 
@@ -683,7 +947,8 @@ document.addEventListener('DOMContentLoaded',()=>{load();['title','transition','
 JOB_JS = r"""
 const jid=location.pathname.split('/').pop();async function tick(){const r=await fetch('/api/job/'+jid);const j=await r.json();
  document.getElementById('st').textContent=j.status+(j.error?' — '+j.error:'');document.querySelector('.bar i').style.width=Math.round((j.progress||0)*100)+'%';
- document.getElementById('pct').textContent=Math.round((j.progress||0)*100)+'%';if(j.status==='done'&&j.item_id){document.getElementById('done').innerHTML='<a class="btn primary big" href="/item/'+j.item_id+'">▶ Play your film</a> <a class="btn" href="/">＋ Make another</a> <a class="btn" href="/studio?from='+j.item_id+'">✂ Fine-tune</a>';return}
+ document.getElementById('pct').textContent=Math.round((j.progress||0)*100)+'%';if(j.status==='done'&&j.item_id){document.getElementById('done').innerHTML='<a class="btn primary big" href="/item/'+j.item_id+'">▶ Open the result</a> <a class="btn" href="/">⌂ Home</a> <a class="btn" href="/cast">🎭 Cast</a>';return}
+ if(j.status==='done'){document.getElementById('done').innerHTML='<a class="btn primary big" href="/cast">✓ Done — back to Cast</a>';return}
  if(j.status==='failed')return;setTimeout(tick,1000)}document.addEventListener('DOMContentLoaded',tick);
 """
 
@@ -713,6 +978,70 @@ def render_job(c: sqlite3.Connection, jid: int) -> str | None:
             f'<div class="bar"><i></i></div><div id="done"></div><p style="color:var(--mut);font-size:13px">{len(spec.get("clips", []))} clips · {html.escape(spec.get("transition", ""))}</p></div>'
             f"<script>{JOB_JS}</script>")
     return page(f"Spark Media · compile #{jid}", body)
+
+
+
+CAST_JS = r"""
+async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return r.json()}
+function go(j){if(j.job){location.href='/job/'+j.job}else alert(j.error||'failed')}
+document.addEventListener('DOMContentLoaded',()=>{
+ const f=document.getElementById('newcast');if(f){const q=new URLSearchParams(location.search);if(q.get('look'))f.look.value=q.get('look');
+  const pick=document.getElementById('picklook');if(pick)pick.onclick=e=>{e.preventDefault();const a=SM.get();if(a.length)f.look.value=a[0].id;else alert('Tap ＋ on a clip in the gallery first, then come back')};
+  f.onsubmit=async e=>{e.preventDefault();const j=await post('/api/cast',{name:f.name.value.trim().toLowerCase(),seed:+f.seed.value||7,look:+f.look.value||null,ref_text:f.ref_text.value});go(j)}}
+ const say=document.getElementById('say');if(say)say.onsubmit=async e=>{e.preventDefault();go(await post('/api/cast/'+say.dataset.id+'/say',{text:say.text.value,seed:+say.seed.value||null}))};
+ const mix=document.getElementById('mix');if(mix){const pick=document.getElementById('pickclip');if(pick)pick.onclick=e=>{e.preventDefault();const a=SM.get();if(a.length)mix.clip.value=a[0].id;else alert('Tap ＋ on a clip in the gallery first')};
+  mix.onsubmit=async e=>{e.preventDefault();go(await post('/api/cast/'+mix.dataset.id+'/mix',{line_id:+mix.line.value,clip_id:+mix.clip.value,at:+mix.at.value||0}))}}
+ const rv=document.getElementById('revoice');if(rv)rv.onclick=async e=>{e.preventDefault();const s=prompt('New voice seed (any number). The voice is remade from scratch and every later line uses it.',String(+rv.dataset.seed+1));if(s===null)return;go(await post('/api/cast/'+rv.dataset.id+'/revoice',{seed:+s||7}))};
+ const shot=document.getElementById('shot');if(shot)shot.onsubmit=async e=>{e.preventDefault();go(await post('/api/cast/'+shot.dataset.id+'/shot',{prompt:shot.prompt.value,duration:+shot.duration.value||4,seed:+shot.seed.value||null}))};
+});
+"""
+
+
+def render_cast(c: sqlite3.Connection) -> str:
+    rows = c.execute("SELECT * FROM cast ORDER BY id DESC").fetchall()
+    cards = []
+    for r in rows:
+        ref = CAST_DIR / f"{r['name']}-ref.png"
+        img = f'<img src="/castref/{r["id"]}.png" alt="">' if ref.exists() else '<div class="noimg">no look yet</div>'
+        cards.append(f'<a class="ccard" href="/cast/{r["id"]}">{img}<div><b>{html.escape(r["name"])}</b><br><span class="mut">voice {"✓ ready" if r["voice_ok"] else "⏳ making"} · seed {r["seed"]}</span></div></a>')
+    body = (f'<div class="detail"><div class="nav"><a class="btn" href="/">⌂ Home</a></div><h2 style="margin:6px 0">Cast</h2>'
+            f'<p class="mut">A character = a look (one of your clips) + a voice that stays the same in every line. Make one, then speak lines, lay them on clips, or render new shots that start from the character\'s face.</p>'
+            f'<div class="ccards">{"".join(cards) or "<p class=mut>No characters yet.</p>"}</div>'
+            '<form id="newcast" class="opts"><label>Name<input name="name" required pattern="[A-Za-z0-9_-]{1,40}" placeholder="nova"></label>'
+            '<label>Voice seed (any number; same seed = same voice)<input name="seed" type="number" value="7"></label>'
+            '<label>Look: library clip # <span><input name="look" type="number" placeholder="e.g. 257" style="width:110px"> <button class="sbtn" id="picklook">use first clip in my film</button></span></label>'
+            '<label>What the voice says first (to learn it)<textarea name="ref_text" rows="3" placeholder="leave empty for the default paragraph"></textarea></label>'
+            '<div><button class="btn primary big" type="submit">🎭 Create character</button> <span class="mut">takes about a minute: the voice engine starts, speaks a reference, and learns it</span></div></form></div>'
+            f"<script>{CAST_JS}</script>")
+    return page("Spark Media · Cast", body)
+
+
+def render_character(c: sqlite3.Connection, cid: int) -> str | None:
+    r = c.execute("SELECT * FROM cast WHERE id=?", (cid,)).fetchone()
+    if not r:
+        return None
+    lines = c.execute("SELECT * FROM items WHERE kind='audio' AND json_valid(meta) AND json_extract(meta,'$.cast_id')=? ORDER BY id DESC LIMIT 30", (cid,)).fetchall()
+    made = c.execute("SELECT * FROM items WHERE kind='video' AND json_valid(meta) AND json_extract(meta,'$.cast_id')=? ORDER BY id DESC LIMIT 30", (cid,)).fetchall()
+    ref = CAST_DIR / f"{r['name']}-ref.png"
+    img = f'<img class="full" src="/castref/{cid}.png" alt="" style="max-height:40vh;object-fit:contain">' if ref.exists() else '<p class="mut">No look yet — create the character with a library clip number, or open a clip and tap “Make a character from this”.</p>'
+    opts = "".join(f'<option value="{l["id"]}">#{l["id"]} · {html.escape((l["prompt"] or l["caption"] or "")[:60])}</option>' for l in lines)
+    line_cards = "".join(f'<div class="row"><img src="/thumb/{l["sha12"]}.jpg"><div><div class="ttl">{html.escape(l["prompt"] or l["caption"] or "")}</div>'
+                         f'<audio controls preload="none" src="/media/{l["sha12"]}{l["ext"]}" style="width:100%"></audio></div></div>' for l in lines)
+    made_cards = "".join(f'<a class="card" href="/item/{m["id"]}"><img loading="lazy" src="/thumb/{m["sha12"]}.jpg" alt=""><span class="b">{fmt_dur(m["duration"])}</span><span class="t">{html.escape(m["tier"])}</span>'
+                         f'<div class="m">{html.escape((m["created_at"] or "")[:16].replace("T", " "))}</div><div class="p">{html.escape((m["caption"] or m["prompt"] or "")[:120])}</div></a>' for m in made)
+    body = (f'<div class="detail"><div class="nav"><a class="btn" href="/">⌂ Home</a><a class="btn" href="/cast">🎭 Cast</a></div>'
+            f'<h2 style="margin:6px 0">{html.escape(r["name"])}</h2><p class="mut">voice {"✓ ready" if r["voice_ok"] else "⏳ still being made — speaking will use the built-in voice until then"} · seed {r["seed"]} · <a href="#" id="revoice" data-id="{cid}" data-seed="{r["seed"]}">↻ re-make the voice</a></p>{img}'
+            f'<form id="say" data-id="{cid}" class="opts"><label>Say a line<textarea name="text" rows="2" required placeholder="Punch it. Warp speed in three, two, one."></textarea></label>'
+            f'<label>Take seed (same seed = same take)<input name="seed" type="number" value="{r["seed"]}"></label><div><button class="btn primary big" type="submit">🗣 Speak</button> <span class="mut">~30 s (starts the voice engine if needed)</span></div></form>'
+            f'<h3>Lines</h3><div class="rows">{line_cards or "<p class=mut>none yet</p>"}</div>'
+            + (f'<form id="mix" data-id="{cid}" class="opts"><label>Put a line on a clip<select name="line">{opts}</select></label>'
+               f'<label>Clip # <span><input name="clip" type="number" placeholder="library clip number" style="width:120px"> <button class="sbtn" id="pickclip">first clip in my film</button></span></label>'
+               f'<label>Start at (seconds)<input name="at" type="number" step="0.1" value="0.5"></label><div><button class="btn primary" type="submit">🎬 Put it on the clip</button> <span class="mut">the clip\'s own sound ducks under the line</span></div></form>' if lines else "")
+            + f'<form id="shot" data-id="{cid}" class="opts"><label>New shot with {html.escape(r["name"])} (starts from the face above)<textarea name="prompt" rows="2" required placeholder="slow push-in, warm light, she looks up and smiles"></textarea></label>'
+              f'<label>Seconds<input name="duration" type="number" min="2" max="15" value="4"></label><label>Seed<input name="seed" type="number" value="{r["seed"]}"></label>'
+              f'<div><button class="btn primary" type="submit">🎥 Render shot</button> <span class="mut">~2 min for 4 s; the look carries over from the reference frame</span></div></form>'
+            f'<h3>Made with {html.escape(r["name"])}</h3><div class="grid" style="padding:0">{made_cards or "<p class=mut>nothing yet</p>"}</div></div><script>{CAST_JS}</script>')
+    return page(f"Spark Media · {r['name']}", body)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -816,6 +1145,14 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, json.dumps(rows).encode(), "application/json")
                 if p == "/studio":
                     return self._send(200, render_studio().encode())
+                if p == "/cast":
+                    return self._send(200, render_cast(c).encode())
+                if p.startswith("/cast/"):
+                    out = render_character(c, int(p[6:]))
+                    return self._send(200, out.encode()) if out else self._send(404, b"no such character", "text/plain")
+                if p.startswith("/castref/"):
+                    r = c.execute("SELECT name FROM cast WHERE id=?", (int(p[9:].split(".")[0]),)).fetchone()
+                    return self._send_file(CAST_DIR / f"{r['name']}-ref.png", "image/png", cache=False) if r else self._send(404, b"", "text/plain")
                 if p.startswith("/job/"):
                     out = render_job(c, int(p[5:]))
                     return self._send(200, out.encode()) if out else self._send(404, b"no such job", "text/plain")
@@ -851,6 +1188,41 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(min(n, 1 << 20)) or b"{}") if n else {}
         except json.JSONDecodeError:
             return self._send(400, b"bad json", "text/plain")
+        if u.path == "/api/cast" or re.fullmatch(r"/api/cast/\d+/(say|mix|shot|revoice)", u.path):
+            try:
+                if u.path == "/api/cast":
+                    name = str(body.get("name") or "").strip().lower()
+                    if not re.fullmatch(r"[a-z0-9_-]{1,40}", name):
+                        return self._send(400, json.dumps({"error": "name: letters, digits, - _ (1-40)"}).encode(), "application/json")
+                    c = db()
+                    try:
+                        cur = c.execute("INSERT INTO cast(name,created_at,seed,look_item,ref_text) VALUES (?,?,?,?,?)",
+                                        (name, dt.datetime.now().isoformat(timespec="seconds"), int(body.get("seed") or 7), body.get("look") or None, str(body.get("ref_text") or "")[:2000]))
+                        c.commit(); cid = cur.lastrowid
+                    except sqlite3.IntegrityError:
+                        c.close(); return self._send(400, json.dumps({"error": "that name exists"}).encode(), "application/json")
+                    c.close()
+                    if body.get("look"):
+                        try:
+                            cc = db(); reference_frame(cc, int(body["look"]), name); cc.close()
+                        except Exception as e:  # noqa: BLE001
+                            log(f"reference frame failed for {name}: {e!r}")
+                    jid = queue_job("voice-create", {"name": name, "seed": int(body.get("seed") or 7)})
+                    return self._send(200, json.dumps({"cast_id": cid, "job": jid}).encode(), "application/json")
+                cid, action = int(u.path.split("/")[3]), u.path.rsplit("/", 1)[-1]
+                if action == "revoice":
+                    c = db(); ch = c.execute("SELECT name, seed FROM cast WHERE id=?", (cid,)).fetchone(); c.close()
+                    if not ch:
+                        return self._send(404, json.dumps({"error": "no such character"}).encode(), "application/json")
+                    return self._send(200, json.dumps({"job": queue_job("voice-create", {"name": ch["name"], "seed": int(body.get("seed") or ch["seed"] or 7), "force": True})}).encode(), "application/json")
+                spec = {"cast_id": cid, **{k: body.get(k) for k in ("text", "seed", "line_id", "clip_id", "at", "gain", "prompt", "duration", "width", "height")}}
+                if action == "say" and not str(spec.get("text") or "").strip():
+                    return self._send(400, json.dumps({"error": "text?"}).encode(), "application/json")
+                if action == "shot" and not str(spec.get("prompt") or "").strip():
+                    return self._send(400, json.dumps({"error": "prompt?"}).encode(), "application/json")
+                return self._send(200, json.dumps({"job": queue_job(action, spec)}).encode(), "application/json")
+            except Exception as e:  # noqa: BLE001
+                return self._send(500, json.dumps({"error": repr(e)}).encode(), "application/json")
         if u.path == "/api/compile":
             try:
                 clips = [c for c in body.get("clips", []) if isinstance(c, dict) and str(c.get("id", "")).isdigit()]
@@ -893,6 +1265,7 @@ def serve(port: int) -> None:
             time.sleep(SCAN_EVERY_S)
     threading.Thread(target=loop, daemon=True, name="scan").start()
     threading.Thread(target=jobs_loop, daemon=True, name="jobs").start()
+    threading.Thread(target=drama_idle_loop, daemon=True, name="drama-idle").start()
     srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     srv.daemon_threads = True
     log(f"serving on :{port}, library {LIB}")
