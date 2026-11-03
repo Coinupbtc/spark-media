@@ -541,8 +541,10 @@ table.kv{width:100%;border-collapse:collapse;margin-top:10px;font-size:14px}tabl
 .nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 10px}.nav .btn{margin:0;font-size:15px;padding:10px 14px}.chip.home{background:#1d2130;color:var(--fg);font-weight:600}
 .strip{width:100%;border-radius:8px;margin-top:10px}.pager{display:flex;justify-content:center;gap:10px;padding:16px}.stats{color:var(--mut);font-size:13px;padding:0 14px}
 pre.prompt{white-space:pre-wrap;background:#0b0d11;padding:10px;border-radius:8px;font:14px/1.45 ui-monospace,Menlo,monospace}
-.card.sel{outline:3px solid var(--acc)}.card .ck{position:absolute;bottom:52px;right:8px;width:24px;height:24px;border-radius:50%;background:#000a;border:2px solid #fff;display:none;align-items:center;justify-content:center;font-size:14px}body.selmode .card .ck{display:flex}.card.sel .ck{background:var(--acc);color:#000;border-color:var(--acc)}
-#tray{position:fixed;left:0;right:0;bottom:0;background:#171a21f2;border-top:1px solid #2a2f3a;padding:10px 14px calc(10px + env(safe-area-inset-bottom));display:none;gap:10px;align-items:center;z-index:9}#tray.on{display:flex}#tray .n{flex:1}
+.card.sel{outline:3px solid var(--acc)}.card .add{position:absolute;bottom:50px;right:8px;width:38px;height:38px;border-radius:50%;background:#000c;border:2px solid #fff;color:#fff;font-size:22px;line-height:1;display:flex;align-items:center;justify-content:center;cursor:pointer;padding:0}.card.sel .add{background:var(--acc);color:#000;border-color:var(--acc);font-weight:700;font-size:18px}
+#tray .film{display:flex;gap:6px;overflow-x:auto;padding-bottom:8px}#tray .film img{width:72px;aspect-ratio:16/9;object-fit:cover;border-radius:6px;border:2px solid var(--acc)}#tray .film .f{position:relative;flex:none}#tray .film .f b{position:absolute;top:2px;left:4px;background:var(--acc);color:#000;border-radius:6px;padding:0 5px;font-size:12px}#tray .film .f .x{position:absolute;top:-6px;right:-6px;background:#000;border:1px solid #fff;color:#fff;border-radius:50%;width:20px;height:20px;font-size:12px;display:flex;align-items:center;justify-content:center}
+#tray .tb{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.btn.big{font-size:18px;padding:12px 18px}
+#tray{position:fixed;left:0;right:0;bottom:0;background:#171a21f2;border-top:1px solid #2a2f3a;padding:10px 14px calc(10px + env(safe-area-inset-bottom));display:none;flex-direction:column;z-index:9}#tray.on{display:flex}#tray .n{flex:1;color:var(--mut);font-size:13px}body.hastray .grid{padding-bottom:170px}
 .btn.primary{background:var(--acc);color:#000;font-weight:600}.btn.danger{background:#3a1d1d}
 .rows{display:flex;flex-direction:column;gap:8px;padding:0 0 100px}.row{display:grid;grid-template-columns:96px 1fr;gap:10px;background:var(--card);border-radius:10px;padding:8px}.row img{width:96px;aspect-ratio:16/9;object-fit:cover;border-radius:6px;background:#000}
 .row .ttl{font-size:13px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.row .ctl{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px}.row input[type=number]{width:72px;background:#0b0d11;color:var(--fg);border:1px solid #2a2f3a;border-radius:6px;padding:6px;font-size:15px}
@@ -554,14 +556,20 @@ pre.prompt{white-space:pre-wrap;background:#0b0d11;padding:10px;border-radius:8p
 
 
 TRAY_JS = r"""
-const SM={key:'sm.sel',get(){try{return JSON.parse(localStorage.getItem(this.key)||'[]')}catch(e){return[]}},set(a){localStorage.setItem(this.key,JSON.stringify(a));this.paint()},
- toggle(id){const a=this.get();const i=a.indexOf(id);if(i>=0)a.splice(i,1);else a.push(id);this.set(a)},has(id){return this.get().includes(id)},
- paint(){const a=this.get();const t=document.getElementById('tray');if(!t)return;document.getElementById('trayN').textContent=a.length;t.classList.toggle('on',a.length>0);
-  document.getElementById('trayGo').href='/studio?ids='+a.join(',');document.querySelectorAll('.card[data-id]').forEach(c=>c.classList.toggle('sel',a.includes(+c.dataset.id)))}};
-document.addEventListener('DOMContentLoaded',()=>{SM.paint();const tc=document.getElementById('trayClear');if(tc)tc.onclick=e=>{e.preventDefault();SM.set([])};
- const sel=document.getElementById('selmode');if(sel){sel.onclick=e=>{e.preventDefault();document.body.classList.toggle('selmode');sel.classList.toggle('on')}}
- document.querySelectorAll('.card[data-id]').forEach(c=>c.addEventListener('click',e=>{if(document.body.classList.contains('selmode')){e.preventDefault();SM.toggle(+c.dataset.id)}}));
- document.querySelectorAll('[data-addsel]').forEach(b=>b.addEventListener('click',e=>{e.preventDefault();const id=+b.dataset.addsel;if(!SM.has(id))SM.toggle(id);b.textContent='✓ In Studio tray ('+SM.get().length+')'}));});
+const SM={key:'sm.film',get(){try{const a=JSON.parse(localStorage.getItem(this.key)||'[]');return a.filter(x=>x&&x.id)}catch(e){return[]}},set(a){localStorage.setItem(this.key,JSON.stringify(a));this.paint()},
+ has(id){return this.get().some(x=>x.id===id)},add(id,sha){if(!this.has(id)){const a=this.get();a.push({id,sha});this.set(a)}},rm(id){this.set(this.get().filter(x=>x.id!==id))},
+ toggle(id,sha){this.has(id)?this.rm(id):this.add(id,sha)},ids(){return this.get().map(x=>x.id)},
+ paint(){const a=this.get();const t=document.getElementById('tray');if(!t)return;document.getElementById('trayN').textContent=a.length;t.classList.toggle('on',a.length>0);document.body.classList.toggle('hastray',a.length>0);
+  document.getElementById('trayGo').href='/studio?ids='+this.ids().join(',');
+  const f=document.getElementById('film');f.innerHTML=a.map((x,i)=>`<div class="f" data-id="${x.id}"><img src="/thumb/${x.sha}.jpg" alt=""><b>${i+1}</b><span class="x">✕</span></div>`).join('');
+  f.querySelectorAll('.f').forEach(el=>el.onclick=()=>SM.rm(+el.dataset.id));
+  document.querySelectorAll('.card[data-id]').forEach(c=>{const id=+c.dataset.id;const i=a.findIndex(x=>x.id===id);c.classList.toggle('sel',i>=0);const b=c.querySelector('.add');if(b)b.textContent=i>=0?String(i+1):'＋'})}};
+async function makeFilm(){const ids=SM.ids();if(!ids.length)return;const d=new Date();const title='Film '+d.toISOString().slice(0,10)+' '+d.toTimeString().slice(0,5);
+ const spec={title,transition:'fade',xfade:0.4,fade_ends:0.3,size:'auto',mute:false,clips:ids.map(id=>({id}))};const b=document.getElementById('trayMake');b.textContent='…';
+ try{const r=await fetch('/api/compile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(spec)});const j=await r.json();if(j.job){SM.set([]);location.href='/job/'+j.job}else{alert(j.error||'failed');b.textContent='▶ Make film'}}catch(e){alert('failed: '+e);b.textContent='▶ Make film'}}
+document.addEventListener('DOMContentLoaded',()=>{SM.paint();const tc=document.getElementById('trayClear');if(tc)tc.onclick=e=>{e.preventDefault();SM.set([])};const mk=document.getElementById('trayMake');if(mk)mk.onclick=e=>{e.preventDefault();makeFilm()};
+ document.querySelectorAll('.card[data-id] .add').forEach(b=>b.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();const c=b.closest('.card');SM.toggle(+c.dataset.id,c.dataset.sha)}));
+ document.querySelectorAll('[data-addsel]').forEach(b=>b.addEventListener('click',e=>{e.preventDefault();const id=+b.dataset.addsel;SM.add(id,b.dataset.sha);b.textContent='✓ In your film ('+SM.get().length+')'}));});
 """
 
 
@@ -569,7 +577,7 @@ def page(title: str, body: str, q: str = "", kind: str = "", project: str = "", 
     qs = lambda **kw: "?" + urllib.parse.urlencode({k: v for k, v in {"q": q, "kind": kind, "project": project, "tier": tier, **kw}.items() if v})  # noqa: E731
     chips = "".join(f'<a class="chip{" on" if kind == k else ""}" href="{qs(kind=k)}">{lbl}</a>' for k, lbl in (("", "All"), ("video", "Video"), ("image", "Photos")))
     chips += "".join(f'<a class="chip{" on" if tier == t else ""}" href="{qs(tier=t)}">{t}</a>' for t in ("full", "draft", "chain", "ab", "proof", "compile"))
-    chips += '<a class="chip" id="selmode" href="#">☑ Select</a><a class="chip" href="/studio">✂ Studio</a>'
+    chips += '<a class="chip" href="/studio" title="trim and fine-tune">✂ Fine-tune</a>'
     opts = "".join(f'<option value="{html.escape(p)}"{" selected" if p == project else ""}>{html.escape(p)}</option>' for p in (projects or []))
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>{html.escape(title)}</title><style>{CSS}</style></head><body>
@@ -577,7 +585,7 @@ def page(title: str, body: str, q: str = "", kind: str = "", project: str = "", 
 <input type="search" name="q" placeholder="search prompts, captions, paths" value="{html.escape(q)}">
 <select name="project" onchange="this.form.submit()"><option value="">all projects</option>{opts}</select>
 <input type="hidden" name="kind" value="{html.escape(kind)}"><input type="hidden" name="tier" value="{html.escape(tier)}"></form>
-<div class="chips">{chips}</div></header><div class="stats">{stats}</div>{body}<div id="tray"><span class="n"><b id="trayN">0</b> selected</span><a class="btn primary" id="trayGo" href="/studio">Open Studio</a><a class="btn" href="#" id="trayClear">Clear</a></div><script>{TRAY_JS}</script></body></html>"""
+<div class="chips">{chips}</div></header><div class="stats">{stats}</div>{body}<div id="tray"><div class="film" id="film"></div><div class="tb"><span class="n">Your film: <b id="trayN">0</b> clips, in the order you tapped</span><a class="btn primary big" id="trayMake" href="#">▶ Make film</a><a class="btn" id="trayGo" href="/studio">Fine-tune</a><a class="btn" href="#" id="trayClear">Clear</a></div></div><script>{TRAY_JS}</script></body></html>"""
 
 
 def fmt_dur(d: float | None) -> str:
@@ -608,7 +616,7 @@ def render_gallery(c: sqlite3.Connection, q: str, kind: str, project: str, tier:
     cards = []
     for r in rows:
         badge = fmt_dur(r["duration"]) if r["kind"] == "video" else f'{r["width"] or "?"}×{r["height"] or "?"}'
-        cards.append(f'<a class="card" data-id="{r["id"]}" href="/item/{r["id"]}"><img loading="lazy" src="/thumb/{r["sha12"]}.jpg" alt=""><span class="b">{badge}</span><span class="ck">✓</span>'
+        cards.append(f'<a class="card" data-id="{r["id"]}" data-sha="{r["sha12"]}" href="/item/{r["id"]}"><img loading="lazy" src="/thumb/{r["sha12"]}.jpg" alt=""><span class="b">{badge}</span><button class="add" type="button" aria-label="add to film">＋</button>'
                      f'<span class="t">{html.escape(r["tier"] or "")}</span><div class="m">{html.escape((r["created_at"] or "")[:16].replace("T", " "))} · {html.escape(r["project"] or "")}</div>'
                      f'<div class="p">{html.escape((r["prompt"] or r["caption"] or r["orig_path"].rsplit("/", 1)[-1])[:140])}</div></a>')
     base = urllib.parse.urlencode({k: v for k, v in {"q": q, "kind": kind, "project": project, "tier": tier}.items() if v})
@@ -638,7 +646,7 @@ def render_item(c: sqlite3.Connection, item_id: int) -> str | None:
             f'{media}{strip}<div><a class="btn" href="{src}" download>Download</a>'
             f'<a class="btn" href="javascript:navigator.clipboard.writeText(document.getElementById(\'pr\').innerText)">Copy prompt</a>'
             f'<a class="btn" href="/?project={urllib.parse.quote(r["project"] or "")}">More from {html.escape(r["project"] or "project")}</a>'
-            f'<a class="btn primary" href="#" data-addsel="{r["id"]}">＋ Add to Studio</a>'
+            f'<a class="btn primary" href="#" data-addsel="{r["id"]}" data-sha="{r["sha12"]}">＋ Add to film</a>'
             + (f'<a class="btn" href="/studio?from={r["id"]}">✂ Re-edit this compile</a>' if r["tier"] == "compile" and meta.get("spec") else "") + '</div>'
             f'<pre class="prompt" id="pr">{html.escape(r["prompt"] or "(no prompt recorded)")}</pre><table class="kv">{rows}</table></div>')
     return page(f"Spark Media · {r['sha12']}", body)
@@ -648,8 +656,8 @@ STUDIO_JS = r"""
 const q=new URLSearchParams(location.search);let clips=[];let opts={title:'',transition:'fade',xfade:0.4,fade_ends:0.3,size:'auto',mute:false};
 async function load(){let ids=(q.get('ids')||'').split(',').filter(Boolean).map(Number);const from=q.get('from');
  if(from){const r=await fetch('/api/items/by-ids?ids='+from);const it=(await r.json())[0];const sp=it&&it.meta&&it.meta.spec;if(sp){clips=sp.clips.map(c=>({...c}));Object.assign(opts,{title:sp.title||'',transition:sp.transition||'fade',xfade:sp.xfade||0.4,fade_ends:sp.fade_ends||0,size:sp.size||'auto',mute:!!sp.mute});ids=clips.map(c=>c.id)}}
- if(!ids.length)ids=SM.get();if(!clips.length)clips=ids.map(id=>({id}));
- if(!ids.length){document.getElementById('rows').innerHTML='<p>No clips yet. Go <a href="/">Home</a>, tap <b>☑ Select</b>, tap clips, then <b>Open Studio</b>.</p>';return}
+ if(!ids.length)ids=SM.ids();if(!clips.length)clips=ids.map(id=>({id}));
+ if(!ids.length){document.getElementById('rows').innerHTML='<p>No clips yet. Go <a href="/">Home</a>, tap <b>＋</b> on clips, then <b>▶ Make film</b> — or <b>Fine-tune</b> to come here.</p>';return}
  const r=await fetch('/api/items/by-ids?ids='+ids.join(','));const items=await r.json();const by={};items.forEach(i=>by[i.id]=i);clips=clips.filter(c=>by[c.id]).map(c=>({...c,item:by[c.id]}));paint()}
 function fmt(x){return x==null||x===''?'':(+x).toFixed(1)}
 function paint(){const o=document.getElementById('rows');o.innerHTML='';clips.forEach((c,i)=>{const it=c.item;const vid=it.kind==='video';const d=document.createElement('div');d.className='row';
@@ -675,7 +683,7 @@ document.addEventListener('DOMContentLoaded',()=>{load();['title','transition','
 JOB_JS = r"""
 const jid=location.pathname.split('/').pop();async function tick(){const r=await fetch('/api/job/'+jid);const j=await r.json();
  document.getElementById('st').textContent=j.status+(j.error?' — '+j.error:'');document.querySelector('.bar i').style.width=Math.round((j.progress||0)*100)+'%';
- document.getElementById('pct').textContent=Math.round((j.progress||0)*100)+'%';if(j.status==='done'&&j.item_id){document.getElementById('done').innerHTML='<a class="btn primary" href="/item/'+j.item_id+'">▶ Open the compiled clip</a> <a class="btn" href="/studio?from='+j.item_id+'">✂ Re-edit</a>';return}
+ document.getElementById('pct').textContent=Math.round((j.progress||0)*100)+'%';if(j.status==='done'&&j.item_id){document.getElementById('done').innerHTML='<a class="btn primary big" href="/item/'+j.item_id+'">▶ Play your film</a> <a class="btn" href="/">＋ Make another</a> <a class="btn" href="/studio?from='+j.item_id+'">✂ Fine-tune</a>';return}
  if(j.status==='failed')return;setTimeout(tick,1000)}document.addEventListener('DOMContentLoaded',tick);
 """
 
@@ -701,7 +709,7 @@ def render_job(c: sqlite3.Connection, jid: int) -> str | None:
         return None
     spec = json.loads(j["spec"] or "{}")
     body = (f'<div class="detail"><div class="nav"><a class="btn" href="/">⌂ Home</a><a class="btn" href="/studio">✂ Studio</a></div>'
-            f'<h2 style="margin:6px 0">Compile #{jid}: {html.escape(spec.get("title") or "")}</h2><p>status: <b id="st">{html.escape(j["status"])}</b> · <span id="pct">0%</span></p>'
+            f'<h2 style="margin:6px 0">Making your film…</h2><p style="color:var(--mut)">{html.escape(spec.get("title") or "")}</p><p>status: <b id="st">{html.escape(j["status"])}</b> · <span id="pct">0%</span></p>'
             f'<div class="bar"><i></i></div><div id="done"></div><p style="color:var(--mut);font-size:13px">{len(spec.get("clips", []))} clips · {html.escape(spec.get("transition", ""))}</p></div>'
             f"<script>{JOB_JS}</script>")
     return page(f"Spark Media · compile #{jid}", body)

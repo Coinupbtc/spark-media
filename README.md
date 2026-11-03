@@ -28,16 +28,16 @@ python3 -I spark_media.py import-discord-log
 python3 -I spark_media.py stats
 ```
 
-## Studio — trim, order, stitch (2026-11-03)
+## Make a film (2026-11-03)
 
-Tap **☑ Select** in the gallery, tap clips (or photos), then **Open Studio** (`/studio`); or **＋ Add to Studio** on any item page.
-In the Studio: reorder (↑ ↓), remove, set in/out points per clip (type seconds, or **▶ preview** and **set in / set out** from
-the player's current time), photos become stills (default 3 s). Options: crossfade (default 0.4 s) or hard cut, fade in/out
-at the ends, output size (auto = largest clip; everything is scaled/letterboxed to one size at 24 fps), mute. **⚙ Compile**
-queues a job: each clip is normalised (trim → scale/pad → 24 fps → stereo 48 kHz), then joined with `xfade`/`acrossfade` or
-`concat`, encoded with libx264 (CRF 18, faststart); the job page shows live progress; the result is ingested as a library item
-(tier `compile`, project `studio`) with a JSON sidecar holding the full recipe, so **✂ Re-edit this compile** reopens it in the
-Studio. Clips longer than 15 s still come from chaining at render time (`h3-long-chain.sh`); the Studio stitches anything after.
+Tap **＋** on clips (or photos) in the gallery — each one shows its number in your film (1, 2, 3, 4…) — then press
+**▶ Make film** in the bar at the bottom. That's it: the clips are joined in the order you tapped with short crossfades,
+a progress bar runs, then **▶ Play your film**. Tap a numbered clip (or its thumbnail in the bar) to take it out; the order
+is the order you tap. **Fine-tune** (`/studio`) is there when you want trims (set in/out from the player), hard cuts,
+end fades, a fixed output size, or mute; a finished film carries its recipe, so **✂ Fine-tune** on it reopens the edit.
+Under the hood: each clip is normalised (trim → scale/letterbox to one size → 24 fps → stereo 48 kHz), joined with
+`xfade`/`acrossfade` or `concat`, encoded with libx264 (CRF 18, faststart), and ingested as a library item (tier `compile`).
+Clips longer than 15 s still come from chaining at render time (`h3-long-chain.sh`); films are stitched after.
 
 Add a root: append `{"path": "~/...", "label": "name", "kinds": ["video","image"], "exclude": ["regex"]}` to
 `config.json`; the next scan picks it up. Metadata precedence per clip: sidecar JSON → twin-test `.txt` → `prompt.txt` →
