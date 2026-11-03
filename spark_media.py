@@ -553,8 +553,7 @@ DRAMA = HOME / "scripts/dgx/drama3.sh"
 ENCODE = HOME / "scripts/dgx/drama3-voice-encode.sh"
 I2V = HOME / ".hermes/scripts/h3-image2video.sh"
 DRAMA_IDLE_STOP_S = 300
-_drama_last_use = 0.0
-_drama_started_by_us = False
+DRAMA_MARK = LIB / "cast" / ".drama-started-by-spark-media"   # exists while we own a running Drama; mtime = last use (survives restarts)
 REF_TEXT = ("Good evening. This is {name}, speaking for the first time. The two Sparks are warm, the lights are low, and the render "
             "queue is empty. Tell me what you want to make tonight, and I will walk you through it, step by step.")
 
@@ -567,42 +566,45 @@ def sh(cmd: list[str], timeout: int = 900, env: dict | None = None, unset: tuple
     return r
 
 
+def drama_touch() -> None:
+    DRAMA_MARK.parent.mkdir(parents=True, exist_ok=True)
+    DRAMA_MARK.touch()
+
+
 def drama_start() -> None:
-    global _drama_last_use, _drama_started_by_us
     sh(["bash", str(DRAMA), "start"], timeout=400)
-    _drama_started_by_us = True
-    _drama_last_use = time.time()
+    drama_touch()
 
 
 def drama_say(text: str, voice: str | None, seed: int | None, out: Path) -> Path:
-    global _drama_last_use
     cmd = ["bash", str(DRAMA), "say", text, "--out", str(out)]
     if voice:
         cmd += ["--voice", voice]
     if seed is not None:
         cmd += ["--seed", str(int(seed))]
     sh(cmd, timeout=900)
-    _drama_last_use = time.time()
+    drama_touch()
     if not out.exists():
         raise RuntimeError("no audio produced")
     return out
 
 
 def drama_stop() -> None:
-    global _drama_started_by_us
     subprocess.run(["bash", str(DRAMA), "stop"], capture_output=True, text=True, timeout=120)
-    _drama_started_by_us = False
+    DRAMA_MARK.unlink(missing_ok=True)
 
 
 def drama_idle_loop() -> None:
+    """Stop Drama 5 min after the last Cast use. Ownership is the marker file, so a service restart cannot orphan a
+    running Drama (it did on 2026-11-03: in-memory flag lost, Drama stayed resident on node4)."""
     while True:
         time.sleep(30)
-        if _drama_started_by_us and time.time() - _drama_last_use > DRAMA_IDLE_STOP_S:
-            try:
+        try:
+            if DRAMA_MARK.exists() and time.time() - DRAMA_MARK.stat().st_mtime > DRAMA_IDLE_STOP_S:
                 drama_stop()
                 log("drama3 stopped after idle")
-            except Exception as e:  # noqa: BLE001
-                log(f"drama idle stop failed: {e!r}")
+        except Exception as e:  # noqa: BLE001
+            log(f"drama idle stop failed: {e!r}")
 
 
 def take_quality(wav: Path, words: int) -> tuple[bool, str]:
