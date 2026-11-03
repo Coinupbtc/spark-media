@@ -1,0 +1,160 @@
+{
+  "_doc": "Roots the scanner walks every 15 min. kinds: video and/or image. tier/label/tags are defaults per root; sidecars and path hints override tier.",
+  "roots": [
+    {
+      "path": "~/Documents/projects/MiniMax-H3-2x-DGX-Spark/output",
+      "label": "h3",
+      "kinds": [
+        "video"
+      ],
+      "tags": [
+        "h3",
+        "pair-a-output"
+      ]
+    },
+    {
+      "path": "~/Documents/projects/h3-series",
+      "label": "h3-series",
+      "kinds": [
+        "video"
+      ],
+      "tags": [
+        "h3",
+        "series"
+      ]
+    },
+    {
+      "path": "~/Documents/projects/h3-blockout-queue",
+      "label": "h3-blockout",
+      "kinds": [
+        "video"
+      ],
+      "tags": [
+        "h3"
+      ]
+    },
+    {
+      "path": "~/Documents/projects/led-test",
+      "label": "led-test",
+      "kinds": [
+        "video"
+      ],
+      "tags": [
+        "h3"
+      ]
+    },
+    {
+      "path": "~/Documents/projects/MiniMax-H3-1x-DGX-Spark/output",
+      "label": "h3-1x",
+      "kinds": [
+        "video"
+      ],
+      "tags": [
+        "h3",
+        "tp1"
+      ]
+    },
+    {
+      "path": "~/Documents/projects/MiniMax-H3-DGX-Spark/output",
+      "label": "h3-tp1-quality",
+      "kinds": [
+        "video"
+      ],
+      "tags": [
+        "h3",
+        "tp1"
+      ]
+    },
+    {
+      "path": "~/Documents/projects/MiniMax-H3-2x-maximus/results",
+      "label": "h3-proofs",
+      "kinds": [
+        "video"
+      ],
+      "tier": "proof",
+      "tags": [
+        "h3",
+        "maximus"
+      ]
+    },
+    {
+      "path": "~/Documents/projects/h3-quality",
+      "label": "h3-quality",
+      "kinds": [
+        "video"
+      ],
+      "tags": [
+        "h3",
+        "ab"
+      ],
+      "exclude": [
+        "/blind/"
+      ]
+    },
+    {
+      "path": "~/Documents/projects/limon-videos",
+      "label": "limon-videos",
+      "kinds": [
+        "video"
+      ],
+      "exclude": [
+        "-discord\\.mp4$"
+      ]
+    },
+    {
+      "path": "~/Documents/projects/rocket-launch",
+      "label": "rocket-launch",
+      "kinds": [
+        "video"
+      ]
+    },
+    {
+      "path": "~/Documents/projects/dino-fossil",
+      "label": "dino-fossil",
+      "kinds": [
+        "video"
+      ]
+    },
+    {
+      "path": "~/Documents/projects/brick-word",
+      "label": "brick-word",
+      "kinds": [
+        "video"
+      ]
+    },
+    {
+      "path": "~/Documents/projects/ordinookis",
+      "label": "ordinookis",
+      "kinds": [
+        "video"
+      ]
+    },
+    {
+      "path": "~/Documents/projects/grave-lantern",
+      "label": "grave-lantern",
+      "kinds": [
+        "video"
+      ]
+    },
+    {
+      "path": "~/Documents/projects/nouscon-2026",
+      "label": "nouscon-2026",
+      "kinds": [
+        "video",
+        "image"
+      ],
+      "exclude": [
+        "/node_modules/",
+        "/assets/"
+      ]
+    },
+    {
+      "path": "~/Pictures",
+      "label": "pictures",
+      "kinds": [
+        "image",
+        "video"
+      ]
+    }
+  ]
+}

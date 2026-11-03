@@ -1,0 +1,19 @@
+[Unit]
+Description=Spark Media - house library of every photo and video the DGX Sparks make (gallery :8120, scans roots every 15 min)
+After=network-online.target
+OnFailure=spark-media-alert.service
+X-Spark-Console=1
+
+[Service]
+Type=simple
+Environment=SPARK_MEDIA_PORT=8120
+Environment=NUMPY_MADVISE_HUGEPAGE=0
+ExecStart=/usr/bin/python3 -I /home/coinupbtc/Documents/projects/spark-media/spark_media.py serve
+WorkingDirectory=/home/coinupbtc/Documents/projects/spark-media
+Restart=always
+RestartSec=10
+MemoryMax=2G
+Nice=5
+
+[Install]
+WantedBy=default.target

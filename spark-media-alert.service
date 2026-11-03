@@ -1,0 +1,6 @@
+[Unit]
+Description=Page when spark-media.service fails (the media library/gallery is down)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'MSG="spark-media.service FAILED - the Spark Media library (:8120) is down. journalctl --user -u spark-media -n 30"; BODY=$(echo "$MSG" | /home/coinupbtc/.hermes/scripts/alert-oneshot.sh spark-media-down 3600); [ -n "$BODY" ] && /home/coinupbtc/.hermes/scripts/alertbot-send.sh --channel system-status --plain "$BODY"'
