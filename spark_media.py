@@ -365,6 +365,7 @@ input[type=search]{flex:1;min-width:160px;background:#0b0d11;border:1px solid #2
 .detail{max-width:1100px;margin:0 auto;padding:12px}.detail video,.detail img.full{width:100%;max-height:72vh;background:#000;border-radius:10px}
 table.kv{width:100%;border-collapse:collapse;margin-top:10px;font-size:14px}table.kv td{padding:6px 8px;border-bottom:1px solid #22262f;vertical-align:top}table.kv td:first-child{color:var(--mut);width:120px;white-space:nowrap}
 .btn{display:inline-block;padding:8px 12px;border-radius:8px;background:#1d2130;color:var(--fg);text-decoration:none;margin:6px 6px 0 0}
+.nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 10px}.nav .btn{margin:0;font-size:15px;padding:10px 14px}.chip.home{background:#1d2130;color:var(--fg);font-weight:600}
 .strip{width:100%;border-radius:8px;margin-top:10px}.pager{display:flex;justify-content:center;gap:10px;padding:16px}.stats{color:var(--mut);font-size:13px;padding:0 14px}
 pre.prompt{white-space:pre-wrap;background:#0b0d11;padding:10px;border-radius:8px;font:14px/1.45 ui-monospace,Menlo,monospace}
 """
@@ -377,7 +378,7 @@ def page(title: str, body: str, q: str = "", kind: str = "", project: str = "", 
     opts = "".join(f'<option value="{html.escape(p)}"{" selected" if p == project else ""}>{html.escape(p)}</option>' for p in (projects or []))
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>{html.escape(title)}</title><style>{CSS}</style></head><body>
-<header><h1><a href="/">Spark Media</a></h1><form method="get" action="/" style="display:contents">
+<header><h1><a href="/">Spark Media</a></h1><a class="chip home" href="/">⌂ Home</a><form method="get" action="/" style="display:contents">
 <input type="search" name="q" placeholder="search prompts, captions, paths" value="{html.escape(q)}">
 <select name="project" onchange="this.form.submit()"><option value="">all projects</option>{opts}</select>
 <input type="hidden" name="kind" value="{html.escape(kind)}"><input type="hidden" name="tier" value="{html.escape(tier)}"></form>
@@ -437,7 +438,9 @@ def render_item(c: sqlite3.Connection, item_id: int) -> str | None:
           ("prompt source", r["prompt_source"] or "—"), ("meta", html.escape(json.dumps(meta)) if meta else "—")]
     rows = "".join(f"<tr><td>{html.escape(k)}</td><td>{v if k in ('also at', 'meta') else html.escape(str(v))}</td></tr>" for k, v in kv)
     strip = f'<img class="strip" src="/strip/{r["sha12"]}.jpg" alt="" onerror="this.remove()">' if r["kind"] == "video" else ""
-    body = (f'<div class="detail">{media}{strip}<div><a class="btn" href="{src}" download>Download</a>'
+    body = (f'<div class="detail"><div class="nav"><a class="btn" href="/" onclick="if(history.length>1){{history.back();return false}}">‹ Back</a>'
+            f'<a class="btn" href="/">⌂ Home</a><a class="btn" href="/?project={urllib.parse.quote(r["project"] or "")}">{html.escape(r["project"] or "project")}</a></div>'
+            f'{media}{strip}<div><a class="btn" href="{src}" download>Download</a>'
             f'<a class="btn" href="javascript:navigator.clipboard.writeText(document.getElementById(\'pr\').innerText)">Copy prompt</a>'
             f'<a class="btn" href="/?project={urllib.parse.quote(r["project"] or "")}">More from {html.escape(r["project"] or "project")}</a></div>'
             f'<pre class="prompt" id="pr">{html.escape(r["prompt"] or "(no prompt recorded)")}</pre><table class="kv">{rows}</table></div>')
