@@ -43,6 +43,21 @@ Add a root: append `{"path": "~/...", "label": "name", "kinds": ["video","image"
 `config.json`; the next scan picks it up. Metadata precedence per clip: sidecar JSON → twin-test `.txt` → `prompt.txt` →
 `gen.log` → Discord caption → filename prefix.
 
+## Save to Photos on iPhone (2026-11-03)
+
+Every item page has **📲 Save to Photos**: tap it, the iOS share sheet opens, tap **Save Video** / **Save Image**.
+A web page can't write to the Photos library directly; the share sheet (`navigator.share` with the file) is the only way,
+and Safari only allows it on a secure page. So serve the gallery over HTTPS as well and set `https_base` in `config.json`:
+
+```bash
+tailscale serve --bg --https=8121 http://127.0.0.1:8120   # tailnet only; undo: tailscale serve --https=8121 off
+```
+
+On the plain-http page the button opens the same item on `https_base`. The file is fetched when the page loads, so the
+tap goes straight to the share sheet. Browsers that can't share files get a normal download. Photos takes the H.264 mp4s;
+`.webm` and audio go to Files. The HTTPS proxy connects from 127.0.0.1, so the local-only endpoints (`/api/ingest`,
+`/api/scan`) also refuse any request carrying `X-Forwarded-For` or `Tailscale-User-Login`.
+
 ## Cast — the same character, the same voice, every time (2026-11-03)
 
 Prompt-only series drift: two "same cartoon reggae singer" clips rendered minutes apart came out as two different people
